@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -274,6 +274,42 @@ async fn main() {
             }
         }
     };
+
+    // Deduplicate against existing playlist tracks
+    eprintln!("Fetching existing playlist tracks...");
+    let existing_ids: HashSet<String> = match yt.get_playlist_tracks(ytmapi_rs::common::PlaylistID::from_raw(playlist_id.get_raw())).await {
+        Ok(tracks) => {
+            use ytmapi_rs::parse::PlaylistItem;
+            let ids: HashSet<String> = tracks.iter().filter_map(|t| {
+                match t {
+                    PlaylistItem::Song(s) => Some(s.video_id.get_raw().to_string()),
+                    PlaylistItem::Video(v) => Some(v.video_id.get_raw().to_string()),
+                    PlaylistItem::UploadSong(u) => Some(u.video_id.get_raw().to_string()),
+                    PlaylistItem::Episode(_) => None,
+                }
+            }).collect();
+            eprintln!("  {} tracks already in playlist", ids.len());
+            ids
+        }
+        Err(e) => {
+            eprintln!("  Warning: could not fetch existing tracks: {e} (proceeding without dedup)");
+            HashSet::new()
+        }
+    };
+    let total_sampled = sampled.len();
+    let new_songs: Vec<SongEntry> = sampled
+        .into_iter()
+        .filter(|s| !existing_ids.contains(s.video_id.get_raw()))
+        .collect();
+    let skipped = total_sampled.saturating_sub(new_songs.len());
+    if skipped > 0 {
+        eprintln!("  Skipping {} songs already in playlist", skipped);
+    }
+    if new_songs.is_empty() {
+        eprintln!("All songs already in playlist. Nothing to add.");
+        return;
+    }
+    let sampled = new_songs;
 
     // Add songs in batches with retry + backoff
     let batch_size = 50;
