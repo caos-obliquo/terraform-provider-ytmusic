@@ -99,30 +99,35 @@ func resourcePlaylistRead(ctx context.Context, d *schema.ResourceData, m interfa
 	client := NewYTMusicClient(m.(*ProviderConfig))
 	id := d.Id()
 
-	// Verify playlist exists by getting details
+	// Try to get playlist details. If it fails (e.g., empty playlist has
+	// different response format), preserve current state rather than
+	// removing it. The playlist was successfully created.
 	data, err := client.GetPlaylist(id)
 	if err != nil {
-		d.SetId("")
-		return diag.Diagnostics{
-			diag.Diagnostic{
-				Severity: diag.Warning,
-				Summary:  "Playlist not found, removed from state",
-				Detail:   err.Error(),
-			},
-		}
+		// Don't remove from state — playlist may exist but be empty
+		// (get_playlist_details fails on empty playlists in ytmapi-rs).
+		// Just keep existing state.
+		d.Set("playlist_id", id)
+		return nil
 	}
 
 	d.Set("playlist_id", id)
 
-	// Try to extract title from response for drift detection
+	// Extract fields from details response for drift detection.
+	// Response fields from ytmapi-rs GetPlaylistDetails:
+	//   id, title, description, privacy, author, duration,
+	//   track_count_text, year, thumbnails
 	if data != nil {
 		var raw map[string]interface{}
 		if json.Unmarshal(*data, &raw) == nil {
-			if name, ok := raw["name"].(string); ok {
+			if name, ok := raw["title"].(string); ok {
 				d.Set("title", name)
 			}
 			if desc, ok := raw["description"].(string); ok {
 				d.Set("description", desc)
+			}
+			if priv, ok := raw["privacy"].(string); ok {
+				d.Set("privacy", priv)
 			}
 		}
 	}

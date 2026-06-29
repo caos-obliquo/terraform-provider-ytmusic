@@ -7,6 +7,7 @@ ytmusic-cli.exe
 
 # Rust
 ytmusic-cli/target/
+genre-to-playlist/target/
 
 # Go
 *.test

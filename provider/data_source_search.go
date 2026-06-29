@@ -53,6 +53,11 @@ func dataSourceSearch() *schema.Resource {
 	}
 }
 
+// albumObj matches the nested album object from ytmapi-rs search results.
+type albumObj struct {
+	Name string `json:"name"`
+}
+
 func dataSourceSearchRead(ctx context.Context, d *schema.ResourceData, m interface{}) diag.Diagnostics {
 	client := NewYTMusicClient(m.(*ProviderConfig))
 	query := d.Get("query").(string)
@@ -68,17 +73,39 @@ func dataSourceSearchRead(ctx context.Context, d *schema.ResourceData, m interfa
 		return nil
 	}
 
-	var rawResults []interface{}
-	if err := json.Unmarshal(*data, &rawResults); err == nil {
-		d.Set("results", rawResults)
-	} else {
+	// Parse JSON array from sidecar response
+	var raw []json.RawMessage
+	if err := json.Unmarshal(*data, &raw); err != nil {
 		// Try single object
-		var rawObj map[string]interface{}
-		if err := json.Unmarshal(*data, &rawObj); err == nil {
-			d.Set("results", []interface{}{rawObj})
+		var single map[string]interface{}
+		if err2 := json.Unmarshal(*data, &single); err2 != nil {
+			return diag.Errorf("parse search results: %s", err)
 		}
+		raw = []json.RawMessage{*data}
 	}
 
+	results := make([]interface{}, 0, len(raw))
+	for _, item := range raw {
+		// Extract flat fields
+		var flat struct {
+			Title   string   `json:"title"`
+			Artist  string   `json:"artist"`
+			VideoID string   `json:"video_id"`
+			Album   albumObj `json:"album"`
+		}
+		if err := json.Unmarshal(item, &flat); err != nil {
+			continue
+		}
+		r := map[string]interface{}{
+			"title":    flat.Title,
+			"artist":   flat.Artist,
+			"video_id": flat.VideoID,
+			"album":    flat.Album.Name,
+		}
+		results = append(results, r)
+	}
+
+	d.Set("results", results)
 	d.SetId(query)
 	return nil
 }

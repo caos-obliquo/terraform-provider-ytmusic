@@ -133,7 +133,13 @@ async fn cmd_playlist_get(cookie: Option<&str>, payload: Option<serde_json::Valu
         None => return Response::err("payload requires 'id' field"),
     };
     let yt = match build_client(cookie).await { Ok(c) => c, Err(e) => return Response::err(e) };
-    let pid = PlaylistID::from_raw(&p.id);
+    // get_playlist_details expects browseId with VL prefix
+    let browse_id = if p.id.starts_with("VL") {
+        p.id.clone()
+    } else {
+        format!("VL{}", p.id)
+    };
+    let pid = PlaylistID::from_raw(&browse_id);
     match yt.get_playlist_details(pid).await {
         Ok(details) => Response::ok(serde_json::to_value(&details).unwrap_or_default()),
         Err(e) => Response::err(format!("playlist get error: {}", e)),
