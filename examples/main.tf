@@ -8,54 +8,25 @@ terraform {
 
 provider "ytmusic" {
   cookie_file = "/home/caos/.config/youtui/cookies.txt"
+  cli_path    = "/home/caos/.terraform.d/plugins/registry.terraform.io/caos-obliquo/ytmusic/0.1.0/linux_amd64/ytmusic-cli"
 }
 
-# ── Playlist resources ────────────────────────────────────────────────
-# Note: video_ids requires known values at plan time.
-# Search results are computed (known after apply), so they can't feed
-# directly into resource.video_ids in the same plan.
-# To populate a playlist from search results:
-#   1. `terraform apply` → outputs search result video_ids
-#   2. Copy desired IDs into video_ids below
-#   3. `terraform apply` again
+# ── Workflow ──────────────────────────────────────────────────────────
+# 1. terraform apply                  → creates empty playlist, outputs ID
+# 2. genre-to-playlist --playlist-id <ID> --genre sasscore   → populates it
+#
+# Terraform owns the playlist lifecycle (create/destroy/import).
+# genre-to-playlist CLI owns the song population (search + add).
 
-resource "ytmusic_playlist" "black_metal" {
-  title       = "Genre: Black Metal"
-  description = "Auto-generated from genre pipeline"
-  privacy     = "private"
-  # video_ids = ["VIDEO_ID_1", "VIDEO_ID_2"]
-}
-
-resource "ytmusic_playlist" "ambient" {
-  title       = "Genre: Ambient"
-  description = "Auto-generated from genre pipeline"
-  privacy     = "private"
-}
-
-# ── Data sources ──────────────────────────────────────────────────────
-
-data "ytmusic_search" "black_metal_songs" {
-  query = "black metal"
-  type  = "songs"
-}
-
-data "ytmusic_search" "ambient_songs" {
-  query = "ambient"
-  type  = "songs"
+resource "ytmusic_playlist" "sasscore" {
+  title       = "Genre: Sasscore"
+  description = "Aggressive, chaotic hardcore with sass/gay/queer themes"
+  privacy     = "unlisted"
 }
 
 # ── Outputs ───────────────────────────────────────────────────────────
 
-output "black_metal_playlist_id" {
-  value = ytmusic_playlist.black_metal.playlist_id
-}
-
-output "black_metal_search_results" {
-  description = "Search results for black metal songs (copy video_ids to populate playlist)"
-  value = data.ytmusic_search.black_metal_songs.results[*].video_id
-}
-
-output "ambient_search_results" {
-  description = "Search results for ambient songs"
-  value = data.ytmusic_search.ambient_songs.results[*].video_id
+output "sasscore_playlist_id" {
+  description = "Feed this to genre-to-playlist --playlist-id"
+  value = ytmusic_playlist.sasscore.playlist_id
 }

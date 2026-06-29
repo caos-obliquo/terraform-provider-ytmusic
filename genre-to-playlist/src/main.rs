@@ -54,15 +54,32 @@ struct Cli {
     /// Playlist name (default: "Genre: <name>")
     #[arg(short = 'N', long)]
     name: Option<String>,
+
+    /// Existing playlist ID to populate (skip create)
+    #[arg(short = 'P', long)]
+    playlist_id: Option<String>,
 }
 
 // ─── Genre data ─────────────────────────────────────────────────────────
 
+/// A single curated entry with specific album search
+#[derive(Deserialize, Clone)]
+struct GenreEntry {
+    artist: String,
+    album: String,
+    year: Option<u16>,
+}
+
+/// Supports two formats:
+///   - `bands: ["Band1", ...]` — old format, search "{band} {genre}"
+///   - `entries: [{artist, album, year?}, ...]` — new format, search "{artist} {album}"
 #[derive(Deserialize, Clone)]
 struct GenreData {
     genre: String,
     description: Option<String>,
+    #[serde(default)]
     bands: Vec<String>,
+    entries: Option<Vec<GenreEntry>>,
 }
 
 // ─── Song tracking ──────────────────────────────────────────────────────
@@ -71,7 +88,14 @@ struct SongEntry {
     video_id: VideoID<'static>,
     title: String,
     artist: String,
-    band: String,
+    source: String, // band name or artist name for display
+}
+
+// ─── Item enum for unified iteration ────────────────────────────────────
+
+enum GenreItem {
+    Band(String),
+    Entry(GenreEntry),
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────
@@ -107,8 +131,9 @@ async fn main() {
     if cli.list_genres {
         println!("Available genres:");
         for (file_name, genre) in &genre_files {
-            let band_count = genre.bands.len();
-            println!("  {} ({})", file_name, band_count);
+            let count = genre.entries.as_ref().map_or(genre.bands.len(), |e| e.len());
+            let mode = if genre.entries.is_some() { "entries" } else { "bands" };
+            println!("  {} ({} {})", file_name, count, mode);
         }
         return;
     }
@@ -130,16 +155,24 @@ async fn main() {
         }
     };
 
-    println!("━━━ Genre: {} ━━━", genre.genre);
-    println!("Bands: {} | Max songs: {} | Cookie: {}",
-        genre.bands.len(), cli.max_songs, cookie.as_ref().unwrap_or(&"<none>".into()));
+    // Build unified item list (bands or entries)
+    let items: Vec<GenreItem> = if let Some(entries) = &genre.entries {
+        entries.iter().map(|e| GenreItem::Entry(e.clone())).collect()
+    } else {
+        genre.bands.iter().map(|b| GenreItem::Band(b.clone())).collect()
+    };
+    let total_items = items.len();
 
-    // Calculate per-band limit
-    let per_band = cli.per_band.unwrap_or_else(|| {
-        let p = cli.max_songs / genre.bands.len().max(1);
+    println!("━━━ Genre: {} ━━━", genre.genre);
+    println!("Items: {} | Max songs: {} | Cookie: {}",
+        total_items, cli.max_songs, cookie.as_ref().unwrap_or(&"<none>".into()));
+
+    // Calculate per-item limit
+    let per_item = cli.per_band.unwrap_or_else(|| {
+        let p = cli.max_songs / total_items.max(1);
         p.max(1).min(100) // at least 1, at most 100
     });
-    println!("Per-band limit: {}", per_band);
+    println!("Per-item limit: {}", per_item);
 
     // Build YT Music client
     let cookie_path = cookie.as_ref().unwrap();
@@ -153,74 +186,91 @@ async fn main() {
     };
     eprintln!("Authenticated OK");
 
-    // Search songs for each band
+    // Search songs for each item
     let mut all_songs: Vec<SongEntry> = Vec::new();
-    let total_bands = genre.bands.len();
 
-    for (i, band) in genre.bands.iter().enumerate() {
-        let query = format!("{} {}", band, genre.genre);
-        eprint!("\rSearching {}/{}: {:<40}", i + 1, total_bands, band);
+    for (i, item) in items.iter().enumerate() {
+        let (display, query, entry_opt) = match item {
+            GenreItem::Band(band) => {
+                (band.clone(), format!("{} {}", band, genre.genre), None)
+            }
+            GenreItem::Entry(entry) => {
+                let q = if let Some(year) = entry.year {
+                    format!("{} {} {}", entry.artist, entry.album, year)
+                } else {
+                    format!("{} {}", entry.artist, entry.album)
+                };
+                (format!("{} - {}", entry.artist, entry.album), q, Some(entry))
+            }
+        };
+        eprint!("\rSearching {}/{}: {:<50}", i + 1, total_items, display);
 
-        match search_band_songs(&yt, &query, band, per_band).await {
+        match search_item_songs(&yt, &query, &display, entry_opt, per_item).await {
             Ok(songs) => all_songs.extend(songs),
-            Err(e) => eprintln!("\n  Warning: search failed for {band}: {e}"),
+            Err(e) => eprintln!("\n  Warning: search failed for {}: {e}", display),
         }
 
         // Rate limit: sleep between searches
-        if i + 1 < total_bands {
+        if i + 1 < total_items {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 
-    eprintln!("\nFound {} songs total from {} bands", all_songs.len(), total_bands);
+    eprintln!("\nFound {} songs total from {} items", all_songs.len(), total_items);
 
     // Sample: ensure diversity
-    let sampled = sample_songs(all_songs, cli.max_songs, per_band);
+    let sampled = sample_songs(all_songs, cli.max_songs, per_item);
 
     if sampled.is_empty() {
         eprintln!("Error: no songs found for this genre");
         std::process::exit(1);
     }
 
-    println!("Sampled {} songs for playlist (max {} per band)", sampled.len(), per_band);
+    println!("Sampled {} songs for playlist (max {} per item)", sampled.len(), per_item);
 
     if cli.dry_run {
         println!("\n── Dry run ──");
         println!("Would create playlist: \"{}\"", cli.name.as_deref().unwrap_or(&format!("Genre: {}", genre.genre)));
         println!("Would add {} songs", sampled.len());
-        // Show band diversity
-        let mut band_counts: HashMap<&str, usize> = HashMap::new();
+        // Show source diversity
+        let mut source_counts: HashMap<&str, usize> = HashMap::new();
         for song in &sampled {
-            *band_counts.entry(&song.band).or_insert(0) += 1;
+            *source_counts.entry(&song.source).or_insert(0) += 1;
         }
-        let mut sorted: Vec<_> = band_counts.into_iter().collect();
+        let mut sorted: Vec<_> = source_counts.into_iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(&a.1));
-        println!("Band diversity (top 10):");
-        for (band, count) in sorted.iter().take(10) {
-            println!("  {:<25} {}", band, count);
+        println!("Item diversity (top 10):");
+        for (source, count) in sorted.iter().take(10) {
+            println!("  {:<30} {}", source, count);
         }
-        println!("Total bands represented: {}", sorted.len());
+        println!("Total items represented: {}", sorted.len());
         return;
     }
 
-    // Create playlist
-    let playlist_name = cli.name.unwrap_or_else(|| format!("Genre: {}", genre.genre));
-    let description = genre.description.unwrap_or_default();
-    let privacy = match cli.privacy.as_str() {
-        "public" => PrivacyStatus::Public,
-        "unlisted" => PrivacyStatus::Unlisted,
-        _ => PrivacyStatus::Private,
-    };
-
-    eprintln!("Creating playlist \"{}\"...", playlist_name);
-    let playlist_id = match yt.create_playlist(CreatePlaylistQuery::new(&playlist_name, Some(&description), privacy)).await {
-        Ok(id) => id,
-        Err(e) => {
-            eprintln!("Error creating playlist: {}", e);
-            std::process::exit(1);
+    // Create or use existing playlist
+    let playlist_id = if let Some(existing_id) = &cli.playlist_id {
+        eprintln!("Using existing playlist: {}", existing_id);
+        ytmapi_rs::common::PlaylistID::from_raw(existing_id)
+    } else {
+        let playlist_name = cli.name.unwrap_or_else(|| format!("Genre: {}", genre.genre));
+        let description = genre.description.unwrap_or_default();
+        let privacy = match cli.privacy.as_str() {
+            "public" => PrivacyStatus::Public,
+            "unlisted" => PrivacyStatus::Unlisted,
+            _ => PrivacyStatus::Private,
+        };
+        eprintln!("Creating playlist \"{}\"...", playlist_name);
+        match yt.create_playlist(CreatePlaylistQuery::new(&playlist_name, Some(&description), privacy)).await {
+            Ok(id) => {
+                eprintln!("Created playlist: {}", id.get_raw());
+                id
+            }
+            Err(e) => {
+                eprintln!("Error creating playlist: {}", e);
+                std::process::exit(1);
+            }
         }
     };
-    eprintln!("Created playlist: {}", playlist_id.get_raw());
 
     // Add songs in batches of 100
     let batch_size = 100;
@@ -235,15 +285,14 @@ async fn main() {
     }
 
     println!("\n━━━ Done ━━━");
-    println!("Playlist: \"{}\"", playlist_name);
     println!("Playlist ID: {}", playlist_id.get_raw());
     println!("Songs: {}", sampled.len());
-    println!("Bands: {}", total_bands);
+    println!("Items: {}", total_items);
 
     // Show first 5 songs as sample
     println!("\nSample songs:");
     for (i, song) in sampled.iter().take(5).enumerate() {
-        println!("  {}. {} - {} ({})", i + 1, song.artist, song.title, song.band);
+        println!("  {}. {} - {} ({})", i + 1, song.artist, song.title, song.source);
     }
 }
 
@@ -273,52 +322,65 @@ fn load_all_genres(dir: &PathBuf) -> Result<Vec<(String, GenreData)>, String> {
 
 // ─── Search ─────────────────────────────────────────────────────────────
 
-async fn search_band_songs(
+async fn search_item_songs(
     yt: &YtMusic<BrowserToken>,
     query: &str,
-    band: &str,
+    display_name: &str,
+    entry: Option<&GenreEntry>,
     limit: usize,
 ) -> Result<Vec<SongEntry>, String> {
     let results = yt.search_songs(query).await.map_err(|e| format!("search error: {e}"))?;
-    let entries: Vec<SongEntry> = results
+    let matched: Vec<SongEntry> = results
         .into_iter()
         .filter(|s| {
-            // Filter: only include songs where the artist name contains the band name
-            // (case-insensitive) to avoid genre cross-contamination
-            s.artist.to_lowercase().contains(&band.to_lowercase())
-                || s.title.to_lowercase().contains(&band.to_lowercase())
+            if let Some(entry) = entry {
+                // Entry-based: prefer album match, fall back to artist match
+                let album_matches = s.album.as_ref().map_or(false, |a|
+                    a.name.to_lowercase().contains(&entry.album.to_lowercase())
+                );
+                let artist_matches =
+                    s.artist.to_lowercase().contains(&entry.artist.to_lowercase());
+                // Accept if album matches, or if artist matches and
+                // no better signal needed
+                album_matches || artist_matches
+            } else {
+                // Band-based: artist or title contains the band name
+                let band_lower = display_name.to_lowercase();
+                s.artist.to_lowercase().contains(&band_lower)
+                    || s.title.to_lowercase().contains(&band_lower)
+            }
         })
         .take(limit)
         .map(|s| SongEntry {
             video_id: s.video_id,
             title: s.title,
             artist: s.artist,
-            band: band.to_string(),
+            source: display_name.to_string(),
         })
         .collect();
-    Ok(entries)
+    Ok(matched)
 }
 
 // ─── Sampling ───────────────────────────────────────────────────────────
 
-fn sample_songs(all_songs: Vec<SongEntry>, max_songs: usize, per_band: usize) -> Vec<SongEntry> {
-    // Group songs by band
-    let mut by_band: HashMap<String, Vec<SongEntry>> = HashMap::new();
+fn sample_songs(all_songs: Vec<SongEntry>, max_songs: usize, per_item: usize) -> Vec<SongEntry> {
+    // Group songs by source (band or artist name)
+    let mut by_source: HashMap<String, Vec<SongEntry>> = HashMap::new();
     for song in all_songs {
-        by_band.entry(song.band.clone()).or_default().push(song);
+        by_source.entry(song.source.clone()).or_default().push(song);
     }
 
-    // Shuffle each band's songs for variety, take per_band from each
+    // Shuffle each source's songs for variety, take per_item from each
     let mut rng = thread_rng();
     let mut sampled: Vec<SongEntry> = Vec::new();
 
-    for (_band, songs) in by_band.iter_mut() {
+    for (_src, songs) in by_source.iter_mut() {
         songs.shuffle(&mut rng);
-        let take = songs.len().min(per_band);
+        let take = songs.len().min(per_item);
         sampled.extend(songs.drain(..take));
     }
 
-    // Shuffle all selected songs (interleave bands)
+    // Shuffle all selected songs (interleave sources)
     sampled.shuffle(&mut rng);
 
     // Cap at max_songs
