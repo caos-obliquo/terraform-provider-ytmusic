@@ -1,0 +1,29 @@
+# Build output
+build/
+
+# Binaries (legacy paths)
+terraform-provider-ytmusic
+ytmusic-cli.exe
+
+# Rust
+ytmusic-cli/target/
+
+# Go
+*.test
+*.out
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfplan
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
