@@ -20,7 +20,7 @@ provider "ytmusic" {
 
 resource "ytmusic_playlist" "sasscore" {
   title       = "Genre: Sasscore"
-  description = "Aggressive, chaotic hardcore with sass/gay/queer themes"
+  description = "Aggressive, chaotic hardcore with sass/gay/queer themes\n\n--\nGenerated via github.com/caos-obliquo/terraform-provider-ytmusic"
   privacy     = "unlisted"
 }
 

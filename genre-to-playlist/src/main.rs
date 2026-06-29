@@ -14,6 +14,8 @@ use ytmapi_rs::query::playlist::PrivacyStatus;
 use ytmapi_rs::query::CreatePlaylistQuery;
 use ytmapi_rs::YtMusic;
 
+const GEN_HEADER: &str = "\n——\nGenerated via github.com/caos-obliquo/terraform-provider-ytmusic";
+
 // ─── CLI ────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
@@ -253,7 +255,8 @@ async fn main() {
         ytmapi_rs::common::PlaylistID::from_raw(existing_id)
     } else {
         let playlist_name = cli.name.unwrap_or_else(|| format!("Genre: {}", genre.genre));
-        let description = genre.description.unwrap_or_default();
+        let desc = genre.description.unwrap_or_default();
+        let description = format!("{}{}", desc, GEN_HEADER);
         let privacy = match cli.privacy.as_str() {
             "public" => PrivacyStatus::Public,
             "unlisted" => PrivacyStatus::Unlisted,
