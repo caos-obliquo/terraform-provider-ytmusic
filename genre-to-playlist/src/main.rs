@@ -275,17 +275,43 @@ async fn main() {
         }
     };
 
-    // Add songs in batches of 100
-    let batch_size = 100;
+    // Add songs in batches with retry + backoff
+    let batch_size = 50;
+    let mut added_total = 0u32;
+    let mut failed_total = 0u32;
     for chunk in sampled.chunks(batch_size) {
         let video_ids: Vec<VideoID<'_>> = chunk.iter().map(|s| s.video_id.clone()).collect();
-        eprint!("Adding batch of {} songs...", video_ids.len());
-        match yt.add_video_items_to_playlist(playlist_id.clone(), video_ids).await {
-            Ok(results) => eprintln!(" {} added", results.len()),
-            Err(e) => eprintln!(" error: {}", e),
+        let mut last_err = String::new();
+        let mut success = false;
+        for attempt in 1..=3 {
+            eprintln!(
+                "Adding batch of {} songs... (attempt {}/3)",
+                video_ids.len(),
+                attempt
+            );
+            match yt.add_video_items_to_playlist(playlist_id.clone(), video_ids.clone()).await {
+                Ok(results) => {
+                    eprintln!("  {} added", results.len());
+                    added_total += results.len() as u32;
+                    success = true;
+                    break;
+                }
+                Err(e) => {
+                    last_err = format!("{}", e);
+                    eprintln!("  failed: {} (retry in {}s)", last_err, match attempt { 1 => 1, 2 => 3, _ => 9 });
+                    tokio::time::sleep(Duration::from_secs(match attempt { 1 => 1, 2 => 3, _ => 9 })).await;
+                }
+            }
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        if !success {
+            eprintln!("  STATUS_FAILED after 3 attempts: {}\n  {} songs skipped", last_err, video_ids.len());
+            failed_total += video_ids.len() as u32;
+        }
+        // Throttle: ramp delay as more songs are added
+        let delay = if added_total > 1000 { 1000 } else if added_total > 500 { 750 } else { 500 };
+        tokio::time::sleep(Duration::from_millis(delay)).await;
     }
+    eprintln!("Add phase done: {} added, {} failed", added_total, failed_total);
 
     println!("\n━━━ Done ━━━");
     println!("Playlist ID: {}", playlist_id.get_raw());
