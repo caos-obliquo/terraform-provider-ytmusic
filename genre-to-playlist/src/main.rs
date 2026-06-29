@@ -394,7 +394,19 @@ async fn search_item_songs(
     entry: Option<&GenreEntry>,
     limit: usize,
 ) -> Result<Vec<SongEntry>, String> {
-    let results = yt.search_songs(query).await.map_err(|e| format!("search error: {e}"))?;
+    // Try primary query (artist + album). If it fails and we have an entry,
+    // fall back to artist-only search.
+    let results = match yt.search_songs(query).await {
+        Ok(r) => r,
+        Err(e) => {
+            if let Some(genre_entry) = entry {
+                eprintln!("\n  Album search failed, retrying with artist: \"{}\"", genre_entry.artist);
+                yt.search_songs(&genre_entry.artist).await.map_err(|e2| format!("fallback search error: {e2}"))?
+            } else {
+                return Err(format!("search error: {e}"));
+            }
+        }
+    };
     let matched: Vec<SongEntry> = results
         .into_iter()
         .filter(|s| {
@@ -405,8 +417,7 @@ async fn search_item_songs(
                 );
                 let artist_matches =
                     s.artist.to_lowercase().contains(&entry.artist.to_lowercase());
-                // Accept if album matches, or if artist matches and
-                // no better signal needed
+                // Accept if album matches, or if artist matches
                 album_matches || artist_matches
             } else {
                 // Band-based: artist or title contains the band name
