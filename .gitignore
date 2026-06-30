@@ -6,7 +6,7 @@ terraform-provider-ytmusic
 ytmusic-cli.exe
 
 # Rust
-ytmusic-cli/target/
+**/target/
 genre-to-playlist/target/
 
 # Go

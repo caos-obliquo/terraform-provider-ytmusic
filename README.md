@@ -91,9 +91,19 @@ cargo run --release -- \
 
 ## Adding a genre
 
-1. Create `genre-to-playlist/genres/<name>.json`
+### Option A — from RYM text dump (recommended)
 
-Two formats:
+1. Export your RYM genre page as plain text to `a.txt`
+2. Convert to JSON:
+   ```bash
+   cd rym-to-genre
+   cargo run --release -- ../a.txt --genre Goregrind --output ../genre-to-playlist/genres/goregrind.json
+   ```
+3. The tool auto-extracts artist/album/year triples and deduplicates.
+
+### Option B — hand-crafted JSON
+
+Create `genre-to-playlist/genres/<name>.json`:
 
 **Band-based** (search "{band} {genre}"):
 ```json
@@ -117,12 +127,13 @@ Two formats:
 
 `year` is optional. Entry mode searches `{artist} {album} {year}` and filters results by album name.
 
-2. Run:
+### Populate
 
 ```bash
+cd genre-to-playlist
 cargo run --release -- --list-genres    # verify it shows up
-cargo run --release -- --genre <name> --dry-run   # preview
-cargo run --release -- --genre <name>             # create
+cargo run --release -- --genre <name> --playlist-id <ID> --cookie ~/.config/youtui/cookies.txt --dry-run
+cargo run --release -- --genre <name> --playlist-id <ID> --cookie ~/.config/youtui/cookies.txt
 ```
 
 ## Structure
