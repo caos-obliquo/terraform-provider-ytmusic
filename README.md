@@ -139,4 +139,8 @@ cargo run --release -- --genre <name>             # create
 
 ## Auth
 
-Export cookies from music.youtube.com (Netscape format). Set via `cookie_file` in Terraform config or `YTMAPI_COOKIE` env var.
+Export cookies from music.youtube.com (Netscape format, **not** HTTP header format — no `Cookie:` prefix).
+
+See `examples/cookies.txt.example` for the expected format.
+
+Set via `cookie_file` in Terraform config or `YTMAPI_COOKIE` env var.

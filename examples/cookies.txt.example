@@ -1,0 +1,21 @@
+# Netscape HTTP Cookie File
+# This is an EXAMPLE file. Replace values with your own exported cookies.
+#
+# How to export:
+#   1. Log into https://music.youtube.com in Chrome/Chromium
+#   2. Install "Get cookies.txt" (or "cookies.txt export") extension
+#   3. Export as Netscape format
+#   4. Save to a secure location (e.g. ~/.config/youtui/cookies.txt)
+#
+# IMPORTANT: The file must be raw Netscape format (tab-separated fields).
+#            Do NOT add a "Cookie:" prefix. The parser reads the raw fields.
+#
+# Format: domain  flag  path  secure  expiration  name  value
+
+.music.youtube.com	TRUE	/	FALSE	1767225600	__Secure-3PSID	example_sid_value_here
+.music.youtube.com	TRUE	/	FALSE	1767225600	__Secure-3PAPISID	example_apisid_value_here
+.music.youtube.com	TRUE	/	FALSE	1767225600	__Secure-3PSIDCC	example_sidcc_value_here
+.music.youtube.com	TRUE	/	FALSE	1767225600	__Secure-3PSIDTS	sidts-example_value_here
+.music.youtube.com	TRUE	/	FALSE	1767225600	__Secure-3PAPISID	example_apisid_value_here
+.music.youtube.com	TRUE	/	TRUE	1767225600	__Secure-1PSID	example_value_here
+.music.youtube.com	TRUE	/	TRUE	1767225600	__Secure-1PSIDTS	sidts-example_value_here
