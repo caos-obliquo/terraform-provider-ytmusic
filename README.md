@@ -91,7 +91,9 @@ cargo run --release -- \
 
 ## Adding a genre
 
-### Option A — from RYM text dump (recommended)
+### Step 1 — Create genre data file
+
+#### Option A — from RYM text dump (recommended)
 
 1. Export your RYM genre page as plain text to `a.txt`
 2. Convert to JSON:
@@ -101,7 +103,7 @@ cargo run --release -- \
    ```
 3. The tool auto-extracts artist/album/year triples and deduplicates.
 
-### Option B — hand-crafted JSON
+#### Option B — hand-crafted JSON
 
 Create `genre-to-playlist/genres/<name>.json`:
 
@@ -127,14 +129,56 @@ Create `genre-to-playlist/genres/<name>.json`:
 
 `year` is optional. Entry mode searches `{artist} {album} {year}` and filters results by album name.
 
-### Populate
+### Step 2 — Wire into Terraform config
+
+Add a resource block to `examples/main.tf`:
+
+```hcl
+resource "ytmusic_playlist" "goregrind" {
+  title       = "Genre: Goregrind"
+  description = "Extreme grindcore with gore-themed lyrics"
+  privacy     = "unlisted"
+
+  lifecycle {
+    ignore_changes = all    # prevents accidental modification after populate
+  }
+}
+
+output "goregrind_playlist_id" {
+  value = ytmusic_playlist.goregrind.playlist_id
+}
+```
+
+Run Terraform to create the empty playlist:
+
+```bash
+cd examples/
+terraform apply          # outputs playlist_id like "PLRALkHBpmpKQ"
+```
+
+### Step 3 — Populate with genre-to-playlist
 
 ```bash
 cd genre-to-playlist
-cargo run --release -- --list-genres    # verify it shows up
-cargo run --release -- --genre <name> --playlist-id <ID> --cookie ~/.config/youtui/cookies.txt --dry-run
-cargo run --release -- --genre <name> --playlist-id <ID> --cookie ~/.config/youtui/cookies.txt
+
+# Dry-run first
+cargo run --release -- \
+  --playlist-id PLRALkHBpmpKQ \
+  --cookie ~/.config/youtui/cookies.txt \
+  --genre goregrind \
+  --dry-run
+
+# Then populate
+cargo run --release -- \
+  --playlist-id PLRALkHBpmpKQ \
+  --cookie ~/.config/youtui/cookies.txt \
+  --genre goregrind \
+  --per-band 3 --max-songs 5000 --privacy unlisted
 ```
+
+**That's it.** Terraform owns the playlist lifecycle (create / destroy / import).
+`genre-to-playlist` owns the song population. Once populated, `lifecycle.ignore_changes`
+prevents Terraform from modifying the playlist content.
 
 ## Structure
 

@@ -1,0 +1,63 @@
+{
+  "version": 4,
+  "terraform_version": "1.15.6",
+  "serial": 14,
+  "lineage": "2cec4d0c-d625-d857-1462-d0377536e3bb",
+  "outputs": {
+    "goregrind_playlist_id": {
+      "value": "PLRALkHBpmpKQ",
+      "type": "string"
+    },
+    "sasscore_playlist_id": {
+      "value": "PLL5VaztfWCWg",
+      "type": "string"
+    }
+  },
+  "resources": [
+    {
+      "mode": "managed",
+      "type": "ytmusic_playlist",
+      "name": "goregrind",
+      "provider": "provider[\"registry.terraform.io/caos-obliquo/ytmusic\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "description": "Extreme grindcore with gore-themed lyrics\n\n--\nGenerated via github.com/caos-obliquo/terraform-provider-ytmusic",
+            "id": "PLRALkHBpmpKQ",
+            "playlist_id": "PLRALkHBpmpKQ",
+            "privacy": "unlisted",
+            "title": "Genre: Goregrind",
+            "video_ids": null
+          },
+          "sensitive_attributes": [],
+          "identity_schema_version": 0,
+          "private": "bnVsbA=="
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "ytmusic_playlist",
+      "name": "sasscore",
+      "provider": "provider[\"registry.terraform.io/caos-obliquo/ytmusic\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "description": "Aggressive, chaotic hardcore with sass/gay/queer themes\n\n--\nGenerated via github.com/caos-obliquo/terraform-provider-ytmusic",
+            "id": "PLL5VaztfWCWg",
+            "playlist_id": "PLL5VaztfWCWg",
+            "privacy": "unlisted",
+            "title": "Genre: Sasscore",
+            "video_ids": null
+          },
+          "sensitive_attributes": [],
+          "identity_schema_version": 0,
+          "private": "bnVsbA=="
+        }
+      ]
+    }
+  ],
+  "check_results": null
+}

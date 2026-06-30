@@ -18,24 +18,20 @@ provider "ytmusic" {
 # Terraform owns the playlist lifecycle (create/destroy/import).
 # genre-to-playlist CLI owns the song population (search + add).
 
-resource "ytmusic_playlist" "sasscore" {
-  title       = "Genre: Sasscore"
-  description = "Aggressive, chaotic hardcore with sass/gay/queer themes\n\n--\nGenerated via github.com/caos-obliquo/terraform-provider-ytmusic"
-  privacy     = "unlisted"
-}
+# Terraform creates the playlist. genre-to-playlist populates it.
+# Once created, lifecycle prevents accidental modification.
 
 resource "ytmusic_playlist" "goregrind" {
   title       = "Genre: Goregrind"
   description = "Extreme grindcore with gore-themed lyrics\n\n--\nGenerated via github.com/caos-obliquo/terraform-provider-ytmusic"
   privacy     = "unlisted"
+
+  lifecycle {
+    ignore_changes = all
+  }
 }
 
 # ── Outputs ───────────────────────────────────────────────────────────
-
-output "sasscore_playlist_id" {
-  description = "Feed this to genre-to-playlist --playlist-id"
-  value = ytmusic_playlist.sasscore.playlist_id
-}
 
 output "goregrind_playlist_id" {
   description = "Feed this to genre-to-playlist --playlist-id"
