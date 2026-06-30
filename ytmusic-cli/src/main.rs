@@ -2,17 +2,15 @@ use std::io::{self, Read, Write};
 use std::collections::BTreeMap;
 use ytmapi_rs::{
     YtMusic,
-    common::{PlaylistID, VideoID, SetVideoID, YoutubeID},
+    common::{PlaylistID, SetVideoID, VideoID, YoutubeID},
     query::{
         CreatePlaylistQuery,
         EditPlaylistQuery,
         GetPlaylistTracksQuery,
         playlist::{AddPlaylistItemsQuery, DuplicateHandlingMode, PrivacyStatus},
     },
-    parse::PlaylistItem,
 };
 use serde::{Deserialize, Serialize};
-use futures::{StreamExt, TryStreamExt};
 
 // ─── Machine protocol: JSON stdin/stdout ───
 
@@ -88,6 +86,7 @@ async fn main() {
         "playlist-remove-artist" => cmd_playlist_remove_artist(req.cookie_file.as_deref(), req.payload).await,
         "playlist-clean" => cmd_playlist_clean(req.cookie_file.as_deref(), req.payload).await,
         "debug-browse" => cmd_debug_browse(req.cookie_file.as_deref(), req.payload).await,
+        "raw-browse" => cmd_raw_browse(req.cookie_file.as_deref(), req.payload).await,
         "search" => cmd_search(req.cookie_file.as_deref(), req.payload).await,
         _ => Response::err(format!("unknown action: {}", req.action)),
     };
@@ -272,6 +271,49 @@ async fn cmd_playlist_remove_items(cookie: Option<&str>, payload: Option<serde_j
     }
 }
 
+// ── Shared: fetch playlist tracks via raw JSON (bypasses ytmapi-rs path bug) ──
+
+async fn fetch_playlist_tracks(yt: &YtMusic<ytmapi_rs::auth::BrowserToken>, playlist_id: &str) -> Result<Vec<serde_json::Value>, String> {
+    let browse_id = if playlist_id.starts_with("VL") { playlist_id.to_string() } else { format!("VL{}", playlist_id) };
+    let pid = PlaylistID::from_raw(&browse_id);
+    let query = GetPlaylistTracksQuery::new(pid);
+    let raw_json = yt.raw_json_query::<GetPlaylistTracksQuery<'_>>(&query).await.map_err(|e| format!("browse error: {e}"))?;
+    let val: serde_json::Value = serde_json::from_str(&raw_json).map_err(|e| format!("JSON parse error: {e}"))?;
+
+    fn flex_text(item: &serde_json::Value, idx: usize) -> String {
+        item.pointer(&format!("/flexColumns/{idx}/musicResponsiveListItemFlexColumnRenderer/text/runs/0/text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("?")
+            .to_string()
+    }
+
+    let base_path = "/contents/twoColumnBrowseResultsRenderer/secondaryContents/sectionListRenderer/contents/0/musicPlaylistShelfRenderer/contents";
+    let items = val.pointer(base_path)
+        .and_then(|a| a.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let tracks: Vec<serde_json::Value> = items.into_iter().filter_map(|item| {
+        // Skip continuation item renderers
+        if item.get("continuationItemRenderer").is_some() { return None; }
+        let renderer = item.get("musicResponsiveListItemRenderer")?;
+        let title = flex_text(renderer, 0);
+        let artist = flex_text(renderer, 1);
+        let album = flex_text(renderer, 2);
+        let video_id = renderer.pointer("/playlistItemData/videoId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        Some(serde_json::json!({
+            "title": title,
+            "artist": artist,
+            "videoId": video_id,
+            "album": album,
+        }))
+    }).collect();
+    Ok(tracks)
+}
+
 // ── Playlist Tracks ─────────────────────────────────────────────────────
 
 async fn cmd_playlist_tracks(cookie: Option<&str>, payload: Option<serde_json::Value>) -> Response {
@@ -280,37 +322,9 @@ async fn cmd_playlist_tracks(cookie: Option<&str>, payload: Option<serde_json::V
         None => return Response::err("payload requires 'id' field"),
     };
     let yt = match build_client(cookie).await { Ok(c) => c, Err(e) => return Response::err(e) };
-    // GetPlaylistTracksQuery needs VL prefix
-    let browse_id = if p.id.starts_with("VL") { p.id.clone() } else { format!("VL{}", p.id) };
-    let pid = PlaylistID::from_raw(&browse_id);
-    let query = GetPlaylistTracksQuery::new(pid);
-    match yt.stream(&query).try_collect::<Vec<_>>().await {
-        Ok(pages) => {
-            let items: Vec<PlaylistItem> = pages.into_iter().flatten().collect();
-            let tracks: Vec<serde_json::Value> = items.iter().filter_map(|item| {
-                match item {
-                    PlaylistItem::Song(s) => {
-                        let artist = s.artists.first().map(|a| a.name.clone()).unwrap_or_default();
-                        Some(serde_json::json!({
-                            "title": s.title,
-                            "artist": artist,
-                            "videoId": s.video_id.get_raw(),
-                            "album": s.album.name,
-                        }))
-                    }
-                    PlaylistItem::Video(v) => {
-                        Some(serde_json::json!({
-                            "title": v.title,
-                            "artist": v.channel_name,
-                            "videoId": v.video_id.get_raw(),
-                        }))
-                    }
-                    _ => None,
-                }
-            }).collect();
-            Response::ok(serde_json::json!({"tracks": tracks, "count": tracks.len()}))
-        }
-        Err(e) => Response::err(format!("playlist tracks error: {}", e)),
+    match fetch_playlist_tracks(&yt, &p.id).await {
+        Ok(tracks) => Response::ok(serde_json::json!({"tracks": tracks, "count": tracks.len()})),
+        Err(e) => Response::err(format!("playlist tracks error: {e}")),
     }
 }
 
@@ -326,42 +340,25 @@ async fn cmd_playlist_remove_artist(cookie: Option<&str>, payload: Option<serde_
         None => return Response::err("payload requires 'id' and 'artist' fields"),
     };
     let yt = match build_client(cookie).await { Ok(c) => c, Err(e) => return Response::err(e) };
-    // Fetch all tracks
-    let browse_id = if p.id.starts_with("VL") { p.id.clone() } else { format!("VL{}", p.id) };
-    let pid = PlaylistID::from_raw(&browse_id);
-    let query = GetPlaylistTracksQuery::new(pid);
-    let pages: Vec<Vec<PlaylistItem>> = match yt.stream(&query).take(50).try_collect().await {
-        Ok(p) => p,
+    let tracks = match fetch_playlist_tracks(&yt, &p.id).await {
+        Ok(t) => t,
         Err(e) => return Response::err(format!("fetch tracks error: {}", e)),
     };
-    let items: Vec<PlaylistItem> = pages.into_iter().flatten().collect();
     let artist_lower = p.artist.to_lowercase();
-
-    // Filter matching tracks, collect their video_ids
-    let to_remove: Vec<SetVideoID<'static>> = items.iter().filter_map(|item| {
-        let artist_name = match item {
-            PlaylistItem::Song(s) => s.artists.first().map(|a| a.name.to_lowercase()),
-            PlaylistItem::Video(v) => Some(v.channel_name.to_lowercase()),
-            _ => None,
-        };
-        if artist_name.map_or(false, |a| a.contains(&artist_lower)) {
-            match item {
-                PlaylistItem::Song(s) => Some(SetVideoID::from_raw(s.video_id.get_raw().to_string())),
-                PlaylistItem::Video(v) => Some(SetVideoID::from_raw(v.video_id.get_raw().to_string())),
-                _ => None,
-            }
-        } else { None }
+    let to_remove: Vec<&serde_json::Value> = tracks.iter().filter(|t| {
+        t.get("artist").and_then(|a| a.as_str()).map_or(false, |a| a.to_lowercase().contains(&artist_lower))
     }).collect();
 
     if to_remove.is_empty() {
         return Response::ok(serde_json::json!({"removed": 0, "message": "no tracks found for artist"}));
     }
 
-    // Remove in batches of 100 (API limit)
     let total = to_remove.len();
     let mut removed = 0;
     for chunk in to_remove.chunks(100) {
-        let ids: Vec<SetVideoID<'_>> = chunk.iter().map(|s| SetVideoID::from_raw(s.get_raw().to_string())).collect();
+        let ids: Vec<SetVideoID<'_>> = chunk.iter().filter_map(|t| {
+            t.get("videoId").and_then(|v| v.as_str()).map(|v| SetVideoID::from_raw(v.to_string()))
+        }).collect();
         match yt.remove_playlist_items(PlaylistID::from_raw(&p.id), ids).await {
             Ok(_) => removed += chunk.len(),
             Err(e) => eprintln!("  remove batch error: {}", e),
@@ -379,28 +376,17 @@ async fn cmd_playlist_clean(cookie: Option<&str>, payload: Option<serde_json::Va
     };
     let yt = match build_client(cookie).await { Ok(c) => c, Err(e) => return Response::err(e) };
 
-    // Fetch all tracks
-    let browse_id = if p.id.starts_with("VL") { p.id.clone() } else { format!("VL{}", p.id) };
-    let pid = PlaylistID::from_raw(&browse_id);
-    let query = GetPlaylistTracksQuery::new(pid);
-    let pages: Vec<Vec<PlaylistItem>> = match yt.stream(&query).take(50).try_collect().await {
-        Ok(p) => p,
+    let tracks = match fetch_playlist_tracks(&yt, &p.id).await {
+        Ok(t) => t,
         Err(e) => return Response::err(format!("fetch tracks error: {}", e)),
     };
-    let items: Vec<PlaylistItem> = pages.into_iter().flatten().collect();
-    eprintln!("Fetched {} tracks", items.len());
+    eprintln!("Fetched {} tracks", tracks.len());
 
     // Group by artist name
     let mut artist_tracks: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for item in &items {
-        let (name, vid) = match item {
-            PlaylistItem::Song(s) => {
-                let name = s.artists.first().map(|a| a.name.clone()).unwrap_or_default();
-                (name, s.video_id.get_raw().to_string())
-            }
-            PlaylistItem::Video(v) => (v.channel_name.clone(), v.video_id.get_raw().to_string()),
-            _ => continue,
-        };
+    for t in &tracks {
+        let name = t.get("artist").and_then(|a| a.as_str()).unwrap_or("?").to_string();
+        let vid = t.get("videoId").and_then(|v| v.as_str()).unwrap_or("").to_string();
         artist_tracks.entry(name).or_default().push(vid);
     }
 
@@ -450,18 +436,10 @@ async fn cmd_playlist_clean(cookie: Option<&str>, payload: Option<serde_json::Va
     let mut total_removed = 0;
     for artist in &to_remove {
         let artist_lower = artist.to_lowercase();
-        let artist_vids: Vec<SetVideoID<'static>> = items.iter().filter_map(|item| {
-            let name = match item {
-                PlaylistItem::Song(s) => s.artists.first().map(|a| a.name.to_lowercase()),
-                PlaylistItem::Video(v) => Some(v.channel_name.to_lowercase()),
-                _ => None,
-            };
-            if name.map_or(false, |n| n.contains(&artist_lower)) {
-                match item {
-                    PlaylistItem::Song(s) => Some(SetVideoID::from_raw(s.video_id.get_raw().to_string())),
-                    PlaylistItem::Video(v) => Some(SetVideoID::from_raw(v.video_id.get_raw().to_string())),
-                    _ => None,
-                }
+        let artist_vids: Vec<SetVideoID<'static>> = tracks.iter().filter_map(|t| {
+            let name = t.get("artist").and_then(|a| a.as_str()).unwrap_or("");
+            if name.to_lowercase().contains(&artist_lower) {
+                t.get("videoId").and_then(|v| v.as_str()).map(|v| SetVideoID::from_raw(v.to_string()))
             } else { None }
         }).collect();
 
@@ -482,6 +460,21 @@ async fn cmd_playlist_clean(cookie: Option<&str>, payload: Option<serde_json::Va
 
 // ── Debug ───────────────────────────────────────────────────────────────
 
+async fn cmd_raw_browse(cookie: Option<&str>, payload: Option<serde_json::Value>) -> Response {
+    let p: PlaylistGetPayload = match payload.and_then(|v| serde_json::from_value(v).ok()) {
+        Some(p) => p,
+        None => return Response::err("payload requires 'id' field"),
+    };
+    let yt = match build_client(cookie).await { Ok(c) => c, Err(e) => return Response::err(e) };
+    let browse_id = if p.id.starts_with("VL") { p.id.clone() } else { format!("VL{}", p.id) };
+    let pid = PlaylistID::from_raw(&browse_id);
+    let query = GetPlaylistTracksQuery::new(pid);
+    match yt.raw_json_query::<GetPlaylistTracksQuery<'_>>(&query).await {
+        Ok(raw) => Response::ok(serde_json::json!({"raw": raw})),
+        Err(e) => Response::err(format!("browse error: {e}")),
+    }
+}
+
 async fn cmd_debug_browse(cookie: Option<&str>, payload: Option<serde_json::Value>) -> Response {
     let p: PlaylistGetPayload = match payload.and_then(|v| serde_json::from_value(v).ok()) {
         Some(p) => p,
@@ -491,7 +484,8 @@ async fn cmd_debug_browse(cookie: Option<&str>, payload: Option<serde_json::Valu
     let browse_id = if p.id.starts_with("VL") { p.id.clone() } else { format!("VL{}", p.id) };
     let pid = ytmapi_rs::common::PlaylistID::from_raw(&browse_id);
     let query = ytmapi_rs::query::GetPlaylistTracksQuery::new(pid);
-    match yt.raw_json_query(&query).await {
+    let raw = yt.raw_json_query::<ytmapi_rs::query::GetPlaylistTracksQuery<'_>>(&query).await;
+    match raw {
         Ok(raw) => {
             // Parse and show top-level keys + relevant sub-paths
             match serde_json::from_str::<serde_json::Value>(&raw) {

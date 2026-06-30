@@ -295,6 +295,7 @@ async fn main() {
     }
 
     if all_songs.is_empty() {
+    let mut rate_limit_errors = 0u32;
     for (i, item) in items.iter().enumerate() {
         let (display, query, entry_opt) = match item {
             GenreItem::Band(band) => {
@@ -311,10 +312,30 @@ async fn main() {
         };
         // Step 1: Search YT Music (strict album match)
         let mut matched = match search_item_songs(&yt, &query, &display, entry_opt, per_item, &valid_artists, true).await {
-            Ok(songs) => songs,
+            Ok(songs) => {
+                rate_limit_errors = 0; // reset on success
+                songs
+            }
             Err(e) => {
-                eprintln!("[{}/{}] ✗ {} — search error: {e}", i + 1, total_items, display);
-                Vec::new()
+                let is_rate_limit = e.contains("invalid json") || e.contains("column: 1");
+                if is_rate_limit {
+                    rate_limit_errors += 1;
+                    let sleep_secs = 30u64 * rate_limit_errors as u64;
+                    eprintln!("[{}/{}] ⏱ {} — rate limited ({e}), sleeping {sleep_secs}s", i + 1, total_items, display);
+                    tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+                    // Retry once after backoff
+                    rate_limit_errors = 0;
+                    match search_item_songs(&yt, &query, &display, entry_opt, per_item, &valid_artists, true).await {
+                        Ok(s) => s,
+                        Err(e2) => {
+                            eprintln!("[{}/{}] ✗ {} — search error after retry: {e2}", i + 1, total_items, display);
+                            Vec::new()
+                        }
+                    }
+                } else {
+                    eprintln!("[{}/{}] ✗ {} — search error: {e}", i + 1, total_items, display);
+                    Vec::new()
+                }
             }
         };
 
