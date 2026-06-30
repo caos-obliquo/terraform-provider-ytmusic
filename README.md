@@ -2,44 +2,48 @@
 
 Terraform provider + CLI tools for YouTube Music.
 
-## Architecture
+Go provider shells out to Rust sidecar (ytmusic-cli) via JSON stdin/stdout.
+genre-to-playlist populates playlists from genre JSON.
+rym-to-genre converts RYM text dumps to genre JSON.
 
-```
-Terraform (Go plugin) ──stdin/stdout──► ytmusic-cli (Rust sidecar)
-                                           └── ytmapi-rs
-```
-
-Go provider shells out to Rust binary via JSON protocol. No HTTP from Go.
-
-## Quick start
+## Build & install
 
 ```bash
-# Build everything
-make all
-
-# Install locally
-make install
-
-# Create a playlist with Terraform
-cd examples/
-terraform apply
+make all      # builds Go provider + ytmusic-cli
+make install  # copies to ~/.terraform.d/plugins/
 ```
 
-## Resources
+## Terraform
 
-| Resource | Description |
-|----------|-------------|
-| `ytmusic_playlist` | CRUD playlist. Fields: `title`, `description`, `privacy`, `video_ids` |
+```
+resource "ytmusic_playlist" "name" {
+  title       = "Genre: Name"
+  description = "..."
+  privacy     = "unlisted"    # private / public / unlisted
 
-## Data sources
+  lifecycle {
+    ignore_changes = all      # prevent overwrite after populate
+  }
+}
 
-| Data source | Description |
-|-------------|-------------|
-| `ytmusic_search` | Search songs/artists/albums/playlists. Fields: `query`, `type`, `results` |
+data "ytmusic_search" "song" {
+  query   = "artist song"
+  type    = "song"
+}
 
-## genre-to-playlist CLI
+output "playlist_id" {
+  value = ytmusic_playlist.name.playlist_id
+}
+```
 
-Batch-create playlists from genre band/album lists.
+Auth: cookies.txt from music.youtube.com (Netscape format, no `Cookie:` prefix).
+Set via `cookie_file` in config or `YTMAPI_COOKIE` env var.
+
+## genre-to-playlist
+
+Batch-search + populate YT Music playlists from genre JSON files.
+
+### Usage
 
 ```bash
 cd genre-to-playlist/
@@ -47,101 +51,117 @@ cd genre-to-playlist/
 # List available genres
 cargo run --release -- --list-genres
 
-# Dry-run (preview without creating)
-cargo run --release -- \
-  --genre sasscore \
-  --cookie /path/to/cookies.txt \
-  --dry-run
+# Dry-run (search + sample, no write)
+cargo run --release -- --genre sasscore --cookie cookies.txt --dry-run
 
-# Create + populate in one step
-cargo run --release -- \
-  --genre sasscore \
-  --cookie /path/to/cookies.txt \
-  --per-band 3 --max-songs 400 --privacy unlisted
+# Create + populate
+cargo run --release -- --genre goregrind --cookie cookies.txt --per-band 10
 
-# Populate an existing playlist (created via Terraform)
-cargo run --release -- \
-  --playlist-id PLffpwpOuFBzw \
-  --genre sasscore \
-  --cookie /path/to/cookies.txt
-```
+# Populate existing (created via terraform apply)
+cargo run --release -- --playlist-id PLxxx --genre goregrind --cookie cookies.txt
 
-### Workflow with Terraform
-
-```
-1. terraform apply        → creates empty playlist, outputs ID
-2. genre-to-playlist \    → searches + populates
-     --playlist-id <ID> \
-     --genre sasscore
-3. terraform destroy      → removes playlist from YT Music
+# Auto-split into Pt.2/Pt.3 when 5000 cap hit
+cargo run --release -- --playlist-id PLxxx --genre goregrind --per-band 10 --auto-split
 ```
 
 ### Flags
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--genre` | required | Genre name matching a file in `genres/` |
-| `--cookie` | `YTMAPI_COOKIE` | Path to cookies.txt |
-| `--playlist-id` | — | Populate existing playlist (skip create) |
-| `--max-songs` | 5000 | Max total songs |
-| `--per-band` | auto | Songs per band (auto = max/size capped 1-100) |
-| `--dry-run` | false | Search + sample only, no write |
-| `--privacy` | private | private / public / unlisted |
-| `--name` | "Genre: \<name\>" | Custom playlist name |
+`--genre <name>` Genre name (matches genres/<name>.json).
+`--cookie <path>` Cookies file path (or YTMAPI_COOKIE env).
+`--playlist-id <id>` Populate existing playlist (skip create).
+`--max-songs <n>` Max songs (default 5000, YT Music cap).
+`--per-band <n>` Songs per band (default auto = max/bands, clamped 1-100).
+`--dry-run` Search + sample only, no write.
+`--privacy <mode>` private/public/unlisted (create only).
+`--name <str>` Custom playlist name (default "Genre: <name>").
+`--genres-dir <dir>` Genre JSON directory (default "genres").
+`--auto-split` Create Pt.2/Pt.3 when near 5000 cap.
+`--prune` Remove non-matching tracks from existing playlist.
 
-## Adding a genre
+### Search pipeline
 
-### Step 1 — Create genre data file
+Per item:
+1. Query: `{artist} {album}` (entry) or `{band} {genre}` (band)
+2. Genre validate: Last.fm album tags (primary) → MusicBrainz tags (fallback). Fail-open.
+3. Broad mode (if validated): re-search artist-only for 3x per-band limit
+4. Hard blocklist: rejects mainstream pop artists
+5. Diversity sample: per-item shuffle, capped at per-band limit
 
-#### Option A — from RYM text dump (recommended)
+### Dedup
 
-1. Export your RYM genre page as plain text to `a.txt`
-2. Convert to JSON:
-   ```bash
-   cd rym-to-genre
-   cargo run --release -- ../a.txt --genre Goregrind --output ../genre-to-playlist/genres/goregrind.json
-   ```
-3. The tool auto-extracts artist/album/year triples and deduplicates.
+Fetches existing playlist tracks via paginated continuation stream. Filters add list to only new video IDs.
 
-#### Option B — hand-crafted JSON
+### Rate limits
 
-Create `genre-to-playlist/genres/<name>.json`:
+50 songs/batch. 3 retries (1s/3s/9s). 500ms throttle (750ms >500 songs, 1000ms >1000).
 
-**Band-based** (search "{band} {genre}"):
+### Genre data format
+
+**Band-based** — search `{band} {genre}`:
 ```json
-{
-  "genre": "Black Metal",
-  "description": "Optional description",
-  "bands": ["Mayhem", "Burzum", "Darkthrone"]
-}
+{"genre": "Black Metal", "description": "...", "bands": ["Mayhem", "Burzum"]}
 ```
 
-**Entry-based** (curated artist/album, more precise):
+**Entry-based** (precise) — search `{artist} {album}`, filter by album name:
 ```json
-{
-  "genre": "Sasscore",
-  "entries": [
-    {"artist": "SeeYouSpaceCowboy...", "album": "The Romance of Affliction", "year": 2021},
-    {"artist": "The Blood Brothers", "album": "...Burn, Piano Island, Burn"}
-  ]
-}
+{"genre": "Sasscore", "entries": [
+  {"artist": "The Blood Brothers", "album": "...Burn, Piano Island, Burn"},
+  {"artist": "SeeYouSpaceCowboy...", "album": "The Romance of Affliction"}
+]}
 ```
 
-`year` is optional. Entry mode searches `{artist} {album} {year}` and filters results by album name.
+Year optional in entries. Album-match only — never falls back to artist-only search (prevents pop leaks).
 
-### Step 2 — Wire into Terraform config
+## rym-to-genre
 
-Add a resource block to `examples/main.tf`:
+Convert RYM text dump to genre JSON.
 
+```bash
+cd rym-to-genre
+cargo run --release -- input.txt --genre Name --output ../genre-to-playlist/genres/name.json
+```
+
+Flags: `--genre` (req), `--output` (default stdout), `--description`, `--force`, `--verbose`.
+
+Parses RYM format: blank-line-separated entries with artist/album/year.
+
+## Adding a new genre
+
+Files to touch:
+
+| # | File | Change |
+|---|------|--------|
+| 1 | `genre-to-playlist/genres/<name>.json` | **New file** — genre data |
+| 2 | `examples/main.tf` | **Edit** — add resource + output block |
+
+No Go provider or genre-to-playlist code changes needed.
+
+### Step 1 — Create genre data
+
+Option A — from RYM text dump:
+```bash
+cd rym-to-genre
+cargo run --release -- ../a.txt --genre Goregrind --description "..." \
+  --output ../genre-to-playlist/genres/goregrind.json
+```
+
+Option B — hand-craft:
+```bash
+vim genre-to-playlist/genres/goregrind.json
+```
+
+Format: bands or entries (see above).
+
+### Step 2 — Wire terraform
+
+Edit `examples/main.tf`:
 ```hcl
 resource "ytmusic_playlist" "goregrind" {
   title       = "Genre: Goregrind"
-  description = "Extreme grindcore with gore-themed lyrics"
+  description = "Extreme grindcore with gore-themed lyrics\n\n--\nGenerated via github.com/caos-obliquo/terraform-provider-ytmusic"
   privacy     = "unlisted"
 
-  lifecycle {
-    ignore_changes = all    # prevents accidental modification after populate
-  }
+  lifecycle { ignore_changes = all }
 }
 
 output "goregrind_playlist_id" {
@@ -149,53 +169,44 @@ output "goregrind_playlist_id" {
 }
 ```
 
-Run Terraform to create the empty playlist:
-
+Apply:
 ```bash
 cd examples/
-terraform apply          # outputs playlist_id like "PLRALkHBpmpKQ"
+terraform apply
 ```
 
-### Step 3 — Populate with genre-to-playlist
+### Step 3 — Populate
 
 ```bash
 cd genre-to-playlist
 
-# Dry-run first
-cargo run --release -- \
-  --playlist-id PLRALkHBpmpKQ \
-  --cookie ~/.config/youtui/cookies.txt \
-  --genre goregrind \
-  --dry-run
+# Dry-run
+cargo run --release -- --playlist-id PLxxx --cookie cookies.txt --genre goregrind --dry-run
 
-# Then populate
-cargo run --release -- \
-  --playlist-id PLRALkHBpmpKQ \
-  --cookie ~/.config/youtui/cookies.txt \
-  --genre goregrind \
-  --per-band 3 --max-songs 5000 --privacy unlisted
+# Populate
+cargo run --release -- --playlist-id PLxxx --cookie cookies.txt --genre goregrind --per-band 10
 ```
 
-**That's it.** Terraform owns the playlist lifecycle (create / destroy / import).
-`genre-to-playlist` owns the song population. Once populated, `lifecycle.ignore_changes`
-prevents Terraform from modifying the playlist content.
+### Step 4 — Update (add more songs later)
 
-## Structure
+```bash
+cargo run --release -- --playlist-id PLxxx --cookie cookies.txt --genre goregrind --per-band 20
+```
+Dedup skips already-existing tracks. Only new ones added.
+
+## Project layout
 
 ```
-├── main.go                         # Go plugin entry
-├── provider/                       # Terraform resources + data sources
-├── ytmusic-cli/src/main.rs         # Rust sidecar (JSON protocol)
-├── genre-to-playlist/              # Batch playlist creator
-│   ├── src/main.rs
-│   └── genres/                     # Genre data files
-└── examples/
+main.go                   Go plugin entry
+provider/                 Terraform resources + data sources
+ytmusic-cli/src/          Rust sidecar (JSON stdin/stdout)
+genre-to-playlist/
+  src/main.rs             CLI + search + add pipeline
+  src/genre_validator.rs  Last.fm + MusicBrainz validation
+  genres/                 Genre data files
+rym-to-genre/             RYM text dump → genre JSON
+examples/
+  main.tf                 Terraform config (add genre resources here)
+  cookies.txt.example     Format reference
+Makefile                  build/install/cross-compile
 ```
-
-## Auth
-
-Export cookies from music.youtube.com (Netscape format, **not** HTTP header format — no `Cookie:` prefix).
-
-See `examples/cookies.txt.example` for the expected format.
-
-Set via `cookie_file` in Terraform config or `YTMAPI_COOKIE` env var.
