@@ -24,9 +24,20 @@ resource "ytmusic_playlist" "sasscore" {
   privacy     = "unlisted"
 }
 
+resource "ytmusic_playlist" "goregrind" {
+  title       = "Genre: Goregrind"
+  description = "Extreme grindcore with gore-themed lyrics\n\n--\nGenerated via github.com/caos-obliquo/terraform-provider-ytmusic"
+  privacy     = "unlisted"
+}
+
 # ── Outputs ───────────────────────────────────────────────────────────
 
 output "sasscore_playlist_id" {
   description = "Feed this to genre-to-playlist --playlist-id"
   value = ytmusic_playlist.sasscore.playlist_id
+}
+
+output "goregrind_playlist_id" {
+  description = "Feed this to genre-to-playlist --playlist-id"
+  value = ytmusic_playlist.goregrind.playlist_id
 }

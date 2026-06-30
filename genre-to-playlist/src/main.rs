@@ -10,8 +10,10 @@ use rand::thread_rng;
 use serde::Deserialize;
 use ytmapi_rs::auth::BrowserToken;
 use ytmapi_rs::common::{VideoID, YoutubeID};
+use ytmapi_rs::parse::PlaylistItem;
 use ytmapi_rs::query::playlist::PrivacyStatus;
 use ytmapi_rs::query::CreatePlaylistQuery;
+use ytmapi_rs::query::GetPlaylistTracksQuery;
 use ytmapi_rs::YtMusic;
 
 mod genre_validator;
@@ -362,8 +364,23 @@ async fn main() {
         ytmapi_rs::common::PlaylistID::from_raw(existing_id)
     } else {
         let playlist_name = cli.name.unwrap_or_else(|| format!("Genre: {}", genre.genre));
-        let desc = genre.description.unwrap_or_default();
-        let description = format!("{}{}", desc, GEN_HEADER);
+        let desc = genre.description.clone().unwrap_or_default();
+        // Try to fetch description from Last.fm tag page if none in genre file
+        let description = if desc.is_empty() {
+            if let Some(ref key) = lastfm_key {
+                match genre_validator::fetch_tag_description(&http_client, &genre.genre, key).await {
+                    Some(tag_desc) => {
+                        eprintln!("  Description from Last.fm: {}", &tag_desc[..tag_desc.len().min(80)]);
+                        format!("{}{}", tag_desc, GEN_HEADER)
+                    }
+                    None => GEN_HEADER.to_string(),
+                }
+            } else {
+                GEN_HEADER.to_string()
+            }
+        } else {
+            format!("{}{}", desc, GEN_HEADER)
+        };
         let privacy = match cli.privacy.as_str() {
             "public" => PrivacyStatus::Public,
             "unlisted" => PrivacyStatus::Unlisted,
@@ -382,23 +399,15 @@ async fn main() {
         }
     };
 
-    // Deduplicate against existing playlist tracks
-    eprintln!("Fetching existing playlist tracks...");
+    // Deduplicate against existing playlist tracks (handles pagination)
+    eprintln!("Fetching existing playlist tracks (streaming all pages)...");
     let raw_id = playlist_id.get_raw().to_string();
     // Browse endpoint needs VL prefix
     let browse_id = if raw_id.starts_with("VL") { raw_id.clone() } else { format!("VL{}", raw_id) };
     let pid = ytmapi_rs::common::PlaylistID::from_raw(&browse_id);
-    let existing_ids: HashSet<String> = match yt.get_playlist_tracks(pid).await {
+    let existing_ids: HashSet<String> = match fetch_all_playlist_tracks(&yt, pid).await {
         Ok(tracks) => {
-            use ytmapi_rs::parse::PlaylistItem;
-            let ids: HashSet<String> = tracks.iter().filter_map(|t| {
-                match t {
-                    PlaylistItem::Song(s) => Some(s.video_id.get_raw().to_string()),
-                    PlaylistItem::Video(v) => Some(v.video_id.get_raw().to_string()),
-                    PlaylistItem::UploadSong(u) => Some(u.video_id.get_raw().to_string()),
-                    PlaylistItem::Episode(_) => None,
-                }
-            }).collect();
+            let ids: HashSet<String> = tracks.iter().filter_map(playlist_item_video_id).collect();
             eprintln!("  {} tracks already in playlist", ids.len());
             ids
         }
@@ -549,6 +558,36 @@ async fn search_item_songs(
         })
         .collect();
     Ok(matched)
+}
+
+// ─── Playlist track fetching (with pagination) ──────────────────────
+
+/// Fetch ALL tracks from a playlist, handling YT Music continuation/pagination.
+async fn fetch_all_playlist_tracks(
+    yt: &YtMusic<BrowserToken>,
+    pid: ytmapi_rs::common::PlaylistID<'_>,
+) -> Result<Vec<PlaylistItem>, String> {
+    use futures::TryStreamExt;
+    let query = GetPlaylistTracksQuery::new(pid);
+    let pages: Vec<Vec<PlaylistItem>> = yt
+        .stream(&query)
+        .try_collect()
+        .await
+        .map_err(|e| format!("fetch playlist tracks: {e}"))?;
+    let num_pages = pages.len();
+    let all: Vec<PlaylistItem> = pages.into_iter().flatten().collect();
+    eprintln!("  Fetched {} total items across {} pages", all.len(), num_pages);
+    Ok(all)
+}
+
+/// Extract video_id string from a PlaylistItem variant.
+fn playlist_item_video_id(item: &PlaylistItem) -> Option<String> {
+    match item {
+        PlaylistItem::Song(s) => Some(s.video_id.get_raw().to_string()),
+        PlaylistItem::Video(v) => Some(v.video_id.get_raw().to_string()),
+        PlaylistItem::UploadSong(u) => Some(u.video_id.get_raw().to_string()),
+        PlaylistItem::Episode(_) => None,
+    }
 }
 
 // ─── Sampling ───────────────────────────────────────────────────────────

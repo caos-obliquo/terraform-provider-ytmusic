@@ -35,6 +35,12 @@ impl GenreClassifier {
             "hardcore".into(),
             "powerviolence".into(),
             "grindcore".into(),
+            "goregrind".into(),
+            "gorenoise".into(),
+            "mincecore".into(),
+            "porngrind".into(),
+            "pornogrind".into(),
+            "cybergrind".into(),
             "metalcore".into(),
             "mathcore".into(),
             "emocore".into(),
@@ -47,13 +53,33 @@ impl GenreClassifier {
             "metal".into(),
             "heavy".into(),
             "extreme".into(),
+            "death".into(),
+            "brutal".into(),
+            "sludge".into(),
+            "drone".into(),
+            "doom".into(),
+            "blackened".into(),
             "underground".into(),
             "avant".into(),
+            "gore".into(),
+            "splatter".into(),
+            "cannibal".into(),
+            "putrid".into(),
+            "necro".into(),
         ];
         // Add target-derived keywords
         let lower = target.to_lowercase();
-        if lower.contains("core") {
+        if lower.contains("core") || lower.contains("grind") {
             pos.push("core".into());
+        }
+        if lower.contains("grind") || lower.contains("gore") || lower.contains("noise") {
+            pos.push("grind".into());
+        }
+        if lower.contains("gore") {
+            pos.push("gore".into());
+        }
+        if lower.contains("death") {
+            pos.push("death".into());
         }
 
         let neg: Vec<String> = vec![
@@ -286,6 +312,33 @@ pub fn get_lastfm_key() -> Option<String> {
     }
     // 2. Fallback to env var
     std::env::var("LASTFM_API_KEY").ok()
+}
+
+/// Fetch a genre description from Last.fm tag page wiki.
+/// Returns the first paragraph (before first newline) of the wiki summary.
+pub async fn fetch_tag_description(client: &reqwest::Client, tag: &str, api_key: &str) -> Option<String> {
+    let url = format!(
+        "{}?method=tag.getInfo&api_key={}&tag={}&format=json",
+        LASTFM_API,
+        urlencoding(api_key),
+        urlencoding(tag),
+    );
+    let resp = client.get(&url).timeout(Duration::from_secs(5)).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let wiki = data.get("tag")?.get("wiki")?;
+    let summary = wiki.get("summary")?.as_str()?;
+    // Take just the first paragraph
+    let first = summary.split("\n\n").next().unwrap_or(summary);
+    let cleaned = first
+        .replace("<a href=\"", "")
+        .replace("\" rel=\"nofollow\">", "")
+        .replace("</a>", "")
+        .trim()
+        .to_string();
+    if cleaned.is_empty() { None } else { Some(cleaned) }
 }
 
 fn urlencoding(s: &str) -> String {
