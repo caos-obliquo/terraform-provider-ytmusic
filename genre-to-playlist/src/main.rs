@@ -16,6 +16,30 @@ use ytmapi_rs::YtMusic;
 
 const GEN_HEADER: &str = "\n——\nGenerated via github.com/caos-obliquo/terraform-provider-ytmusic";
 
+// Hard blocklist — artists that are NEVER valid for any genre pipeline.
+// Prevents pop/mainstream leaks when search returns top hits.
+const POP_BLOCKLIST: &[&str] = &[
+    "katy perry", "drake", "bruno mars", "rick astley", "shawn mendes",
+    "one direction", "gigi perez", "dominic fike", "arjan dhillon",
+    "taylor swift", "britney spears", "justin bieber", "ed sheeran",
+    "billie eilish", "ariana grande", "selena gomez", "dua lipa",
+    "harry styles", "the weeknd", "post malone", "eminem",
+    "cardi b", "nicki minaj", "lady gaga", "rihanna", "beyonce",
+    "elton john", "madonna", "michael jackson", "prince",
+    "maroon 5", "coldplay", "imagine dragons", "twenty one pilots",
+    "panic! at the disco", "fall out boy", "chainsmokers",
+    "halsey", "lizzo", "miley cyrus", "demi lovato",
+    "charlie puth", "sam smith", "adele", "shakira",
+    "pink", "jennifer lopez", "usher", "akon", "pitbull",
+    "flo rida", "will.i.am", "black eyed peas", "fergie",
+    "sia", "tove lo", "lorde", "ellie goulding",
+    "calvin harris", "david guetta", "avicii", "kygo",
+    "zara larsson", "anne-marie", "rita ora",
+    "doja cat", "megan thee stallion", "saweetie",
+    "olivia rodrigo", "lil nas x", "jack harlow",
+    "bts", "blackpink", "twice",
+];
+
 // ─── CLI ────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
@@ -60,6 +84,10 @@ struct Cli {
     /// Existing playlist ID to populate (skip create)
     #[arg(short = 'P', long)]
     playlist_id: Option<String>,
+
+    /// Prune non-genre tracks from the playlist (removes non-matching)
+    #[arg(long)]
+    prune: bool,
 }
 
 // ─── Genre data ─────────────────────────────────────────────────────────
@@ -176,6 +204,14 @@ async fn main() {
     });
     println!("Per-item limit: {}", per_item);
 
+    // Build artist whitelist from genre entries (for validation layer)
+    let valid_artists: HashSet<String> = if let Some(entries) = &genre.entries {
+        entries.iter().map(|e| e.artist.to_lowercase()).collect()
+    } else {
+        genre.bands.iter().map(|b| b.to_lowercase()).collect()
+    };
+    eprintln!("Valid artists in genre: {}", valid_artists.len());
+
     // Build YT Music client
     let cookie_path = cookie.as_ref().unwrap();
     eprintln!("Authenticating...");
@@ -207,7 +243,7 @@ async fn main() {
         };
         eprint!("\rSearching {}/{}: {:<50}", i + 1, total_items, display);
 
-        match search_item_songs(&yt, &query, &display, entry_opt, per_item).await {
+        match search_item_songs(&yt, &query, &display, entry_opt, per_item, &valid_artists).await {
             Ok(songs) => all_songs.extend(songs),
             Err(e) => eprintln!("\n  Warning: search failed for {}: {e}", display),
         }
@@ -277,7 +313,11 @@ async fn main() {
 
     // Deduplicate against existing playlist tracks
     eprintln!("Fetching existing playlist tracks...");
-    let existing_ids: HashSet<String> = match yt.get_playlist_tracks(ytmapi_rs::common::PlaylistID::from_raw(playlist_id.get_raw())).await {
+    let raw_id = playlist_id.get_raw().to_string();
+    // Browse endpoint needs VL prefix
+    let browse_id = if raw_id.starts_with("VL") { raw_id.clone() } else { format!("VL{}", raw_id) };
+    let pid = ytmapi_rs::common::PlaylistID::from_raw(&browse_id);
+    let existing_ids: HashSet<String> = match yt.get_playlist_tracks(pid).await {
         Ok(tracks) => {
             use ytmapi_rs::parse::PlaylistItem;
             let ids: HashSet<String> = tracks.iter().filter_map(|t| {
@@ -393,32 +433,35 @@ async fn search_item_songs(
     display_name: &str,
     entry: Option<&GenreEntry>,
     limit: usize,
+    valid_artists: &HashSet<String>,
 ) -> Result<Vec<SongEntry>, String> {
-    // Try primary query (artist + album). If it fails and we have an entry,
-    // fall back to artist-only search.
-    let results = match yt.search_songs(query).await {
-        Ok(r) => r,
-        Err(e) => {
-            if let Some(genre_entry) = entry {
-                eprintln!("\n  Album search failed, retrying with artist: \"{}\"", genre_entry.artist);
-                yt.search_songs(&genre_entry.artist).await.map_err(|e2| format!("fallback search error: {e2}"))?
-            } else {
-                return Err(format!("search error: {e}"));
-            }
-        }
-    };
+    // For entries mode: only accept album matches. If album search fails or
+    // returns no matches, skip the entry entirely. No artist-only fallback,
+    // no artist-name filter — that's how Katy Perry leaks into sasscore.
+    let results = yt.search_songs(query).await.map_err(|e| format!("search error: {e}"))?;
     let matched: Vec<SongEntry> = results
         .into_iter()
         .filter(|s| {
+            let artist = s.artist.to_lowercase();
+
+            // LAYER 3: Pop blocklist — hard reject known mainstream artists
+            if POP_BLOCKLIST.iter().any(|pop| artist.contains(pop)) {
+                return false;
+            }
+
             if let Some(entry) = entry {
-                // Entry-based: prefer album match, fall back to artist match
-                let album_matches = s.album.as_ref().map_or(false, |a|
+                // LAYER 2: Artist whitelist — must match a known genre artist
+                let valid_artist = valid_artists.iter().any(|va| {
+                    artist.contains(va) || va.contains(&artist)
+                });
+                if !valid_artist {
+                    return false;
+                }
+
+                // LAYER 1: Album must match (case-insensitive)
+                s.album.as_ref().map_or(false, |a|
                     a.name.to_lowercase().contains(&entry.album.to_lowercase())
-                );
-                let artist_matches =
-                    s.artist.to_lowercase().contains(&entry.artist.to_lowercase());
-                // Accept if album matches, or if artist matches
-                album_matches || artist_matches
+                )
             } else {
                 // Band-based: artist or title contains the band name
                 let band_lower = display_name.to_lowercase();
