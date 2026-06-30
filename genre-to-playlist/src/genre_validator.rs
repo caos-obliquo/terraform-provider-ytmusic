@@ -264,6 +264,30 @@ async fn check_musicbrainz(
 
 // ─── Helpers ─────────────────────────────────────────────────────────────
 
+/// Get Last.fm API key from youtui config or env var.
+/// Tries: ~/.config/youtui/config.toml → [scrobbling].api_key → $LASTFM_API_KEY
+pub fn get_lastfm_key() -> Option<String> {
+    // 1. Try youtui config file
+    if let Some(config_dir) = dirs::config_dir() {
+        let path = config_dir.join("youtui").join("config.toml");
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(config) = content.parse::<toml::Value>() {
+                if let Some(key) = config
+                    .get("scrobbling")
+                    .and_then(|s| s.get("api_key"))
+                    .and_then(|k| k.as_str())
+                {
+                    if !key.is_empty() {
+                        return Some(key.to_string());
+                    }
+                }
+            }
+        }
+    }
+    // 2. Fallback to env var
+    std::env::var("LASTFM_API_KEY").ok()
+}
+
 fn urlencoding(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for byte in s.bytes() {

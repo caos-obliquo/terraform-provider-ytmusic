@@ -232,11 +232,11 @@ async fn main() {
         .timeout(Duration::from_secs(10))
         .build()
         .expect("build reqwest client");
-    let lastfm_key = std::env::var("LASTFM_API_KEY").ok().filter(|s| !s.is_empty());
+    let lastfm_key = genre_validator::get_lastfm_key();
     if lastfm_key.is_some() {
-        eprintln!("Last.fm genre validation: enabled");
+        eprintln!("Last.fm genre validation: enabled (from youtui config)");
     } else {
-        eprintln!("Last.fm genre validation: disabled (set LASTFM_API_KEY)");
+        eprintln!("Last.fm genre validation: disabled (set LASTFM_API_KEY or add [scrobbling].api_key to ~/.config/youtui/config.toml)");
     }
     eprintln!("MusicBrainz genre validation: enabled (fallback)");
     let mut genre_cache: HashMap<(String, String), genre_validator::GenreVerdict> = HashMap::new();
