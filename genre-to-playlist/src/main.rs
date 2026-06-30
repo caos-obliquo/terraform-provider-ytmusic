@@ -265,8 +265,8 @@ async fn main() {
         };
         eprint!("\rSearching {}/{}: {:<50}", i + 1, total_items, display);
 
-        // Step 1: Search YT Music + apply static filters
-        let matched = match search_item_songs(&yt, &query, &display, entry_opt, per_item, &valid_artists).await {
+        // Step 1: Search YT Music + apply static filters (strict album match)
+        let matched = match search_item_songs(&yt, &query, &display, entry_opt, per_item, &valid_artists, true).await {
             Ok(songs) => songs,
             Err(e) => {
                 eprintln!("\n  Warning: search failed for {}: {e}", display);
@@ -301,6 +301,17 @@ async fn main() {
             match &verdict {
                 genre_validator::GenreVerdict::Accept => {
                     all_songs.extend(matched);
+                    // Verified genre entry: do a broad artist search to catch more songs
+                    // that album-specific search might have missed.
+                    let broad_query = entry.artist.clone();
+                    // Use higher limit for broad search to get discography coverage
+                    let broad_limit = per_item * 3;
+                    if let Ok(broad_results) = search_item_songs(
+                        &yt, &broad_query, &display, Some(entry), broad_limit,
+                        &valid_artists, true, /* album_match_required = false */
+                    ).await {
+                        all_songs.extend(broad_results);
+                    }
                     accepted_count += 1;
                 }
                 genre_validator::GenreVerdict::Reject(reason) => {
@@ -514,10 +525,8 @@ async fn search_item_songs(
     entry: Option<&GenreEntry>,
     limit: usize,
     valid_artists: &HashSet<String>,
+    album_match_required: bool,
 ) -> Result<Vec<SongEntry>, String> {
-    // For entries mode: only accept album matches. If album search fails or
-    // returns no matches, skip the entry entirely. No artist-only fallback,
-    // no artist-name filter — that's how Katy Perry leaks into sasscore.
     let results = yt.search_songs(query).await.map_err(|e| format!("search error: {e}"))?;
     let matched: Vec<SongEntry> = results
         .into_iter()
@@ -538,10 +547,15 @@ async fn search_item_songs(
                     return false;
                 }
 
-                // LAYER 1: Album must match (case-insensitive)
-                s.album.as_ref().map_or(false, |a|
-                    a.name.to_lowercase().contains(&entry.album.to_lowercase())
-                )
+                if album_match_required {
+                    // LAYER 1: Strict album match (for unverified entries — prevents pop leaks)
+                    s.album.as_ref().map_or(false, |a|
+                        a.name.to_lowercase().contains(&entry.album.to_lowercase())
+                    )
+                } else {
+                    // Broad match (for genre-verified entries — accept any song by artist)
+                    true
+                }
             } else {
                 // Band-based: artist or title contains the band name
                 let band_lower = display_name.to_lowercase();
