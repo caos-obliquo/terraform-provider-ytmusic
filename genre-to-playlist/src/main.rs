@@ -14,6 +14,8 @@ use ytmapi_rs::query::playlist::PrivacyStatus;
 use ytmapi_rs::query::CreatePlaylistQuery;
 use ytmapi_rs::YtMusic;
 
+mod genre_validator;
+
 const GEN_HEADER: &str = "\n——\nGenerated via github.com/caos-obliquo/terraform-provider-ytmusic";
 
 // Hard blocklist — artists that are NEVER valid for any genre pipeline.
@@ -224,6 +226,24 @@ async fn main() {
     };
     eprintln!("Authenticated OK");
 
+    // HTTP client + Last.fm key for dynamic genre validation
+    let http_client = reqwest::Client::builder()
+        .user_agent("genre-to-playlist/0.1.0")
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("build reqwest client");
+    let lastfm_key = std::env::var("LASTFM_API_KEY").ok().filter(|s| !s.is_empty());
+    if lastfm_key.is_some() {
+        eprintln!("Last.fm genre validation: enabled");
+    } else {
+        eprintln!("Last.fm genre validation: disabled (set LASTFM_API_KEY)");
+    }
+    eprintln!("MusicBrainz genre validation: enabled (fallback)");
+    let mut genre_cache: HashMap<(String, String), genre_validator::GenreVerdict> = HashMap::new();
+    let mut accepted_count = 0usize;
+    let mut rejected_count = 0usize;
+    let mut uncertain_count = 0usize;
+
     // Search songs for each item
     let mut all_songs: Vec<SongEntry> = Vec::new();
 
@@ -243,9 +263,59 @@ async fn main() {
         };
         eprint!("\rSearching {}/{}: {:<50}", i + 1, total_items, display);
 
-        match search_item_songs(&yt, &query, &display, entry_opt, per_item, &valid_artists).await {
-            Ok(songs) => all_songs.extend(songs),
-            Err(e) => eprintln!("\n  Warning: search failed for {}: {e}", display),
+        // Step 1: Search YT Music + apply static filters
+        let matched = match search_item_songs(&yt, &query, &display, entry_opt, per_item, &valid_artists).await {
+            Ok(songs) => songs,
+            Err(e) => {
+                eprintln!("\n  Warning: search failed for {}: {e}", display);
+                Vec::new()
+            }
+        };
+
+        if matched.is_empty() {
+            if i + 1 < total_items {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            continue;
+        }
+
+        // Step 2: Dynamic genre validation (per entry, cached)
+        if let Some(entry) = entry_opt {
+            let cache_key = (entry.artist.to_lowercase(), entry.album.to_lowercase());
+            let verdict = if let Some(v) = genre_cache.get(&cache_key) {
+                v.clone()
+            } else {
+                let v = genre_validator::validate(
+                    &http_client,
+                    &entry.artist,
+                    &entry.album,
+                    &genre.genre,
+                    lastfm_key.as_deref(),
+                ).await;
+                genre_cache.insert(cache_key.clone(), v);
+                genre_cache.get(&cache_key).unwrap().clone()
+            };
+
+            match &verdict {
+                genre_validator::GenreVerdict::Accept => {
+                    all_songs.extend(matched);
+                    accepted_count += 1;
+                }
+                genre_validator::GenreVerdict::Reject(reason) => {
+                    eprintln!("\n  ✗ {} rejected: {}", display, reason);
+                    rejected_count += 1;
+                }
+                genre_validator::GenreVerdict::Uncertain => {
+                    // Fail open: accept but note it
+                    all_songs.extend(matched);
+                    uncertain_count += 1;
+                    eprintln!("\n  ? {} uncertain genre (added anyway)", display);
+                }
+            }
+        } else {
+            // Band mode: no dynamic validation, accept all
+            all_songs.extend(matched);
+            accepted_count += 1;
         }
 
         // Rate limit: sleep between searches
@@ -254,7 +324,8 @@ async fn main() {
         }
     }
 
-    eprintln!("\nFound {} songs total from {} items", all_songs.len(), total_items);
+    eprintln!("\nGenre validation: {} accepted, {} rejected, {} uncertain", accepted_count, rejected_count, uncertain_count);
+    eprintln!("Found {} songs total from {} items", all_songs.len(), total_items);
 
     // Sample: ensure diversity
     let sampled = sample_songs(all_songs, cli.max_songs, per_item);
