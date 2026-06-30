@@ -92,6 +92,10 @@ struct Cli {
     /// Prune non-genre tracks from the playlist (removes non-matching)
     #[arg(long)]
     prune: bool,
+
+    /// Auto-create next part when playlist nears YT Music's 5000 cap
+    #[arg(long)]
+    auto_split: bool,
 }
 
 // ─── Genre data ─────────────────────────────────────────────────────────
@@ -370,11 +374,11 @@ async fn main() {
     }
 
     // Create or use existing playlist
-    let playlist_id = if let Some(existing_id) = &cli.playlist_id {
+    let mut playlist_id = if let Some(existing_id) = &cli.playlist_id {
         eprintln!("Using existing playlist: {}", existing_id);
         ytmapi_rs::common::PlaylistID::from_raw(existing_id)
     } else {
-        let playlist_name = cli.name.unwrap_or_else(|| format!("Genre: {}", genre.genre));
+        let playlist_name = cli.name.clone().unwrap_or_else(|| format!("Genre: {}", genre.genre));
         let desc = genre.description.clone().unwrap_or_default();
         // Try to fetch description from Last.fm tag page if none in genre file
         let description = if desc.is_empty() {
@@ -442,10 +446,19 @@ async fn main() {
     }
     let sampled = new_songs;
 
+    // Base playlist name for auto-split parts
+    let base_title = cli.name.as_deref().unwrap_or(&format!("Genre: {}", genre.genre)).to_string();
+    let privacy_status = match cli.privacy.as_str() {
+        "public" => PrivacyStatus::Public,
+        "unlisted" => PrivacyStatus::Unlisted,
+        _ => PrivacyStatus::Private,
+    };
+
     // Add songs in batches with retry + backoff
     let batch_size = 50;
     let mut added_total = 0u32;
     let mut failed_total = 0u32;
+    let mut part = 1u32;
     for chunk in sampled.chunks(batch_size) {
         let video_ids: Vec<VideoID<'_>> = chunk.iter().map(|s| s.video_id.clone()).collect();
         let mut last_err = String::new();
@@ -471,8 +484,46 @@ async fn main() {
             }
         }
         if !success {
-            eprintln!("  STATUS_FAILED after 3 attempts: {}\n  {} songs skipped", last_err, video_ids.len());
-            failed_total += video_ids.len() as u32;
+            if cli.auto_split {
+                // Try creating next part and retry the batch there
+                part += 1;
+                let part_name = format!("{} (Pt. {})", base_title, part);
+                let desc = format!("Continuation of {}{}", base_title, GEN_HEADER);
+                eprintln!("  Creating next part: \"{}\"...", part_name);
+                match yt.create_playlist(CreatePlaylistQuery::new(&part_name, Some(&desc), privacy_status.clone())).await {
+                    Ok(new_id) => {
+                        eprintln!("  Created: {}", new_id.get_raw());
+                        playlist_id = new_id;
+                        // Retry the same batch on new playlist
+                        for attempt in 1..=3 {
+                            eprintln!("  Retrying batch on new playlist (attempt {}/3)", attempt);
+                            match yt.add_video_items_to_playlist(playlist_id.clone(), video_ids.clone()).await {
+                                Ok(results) => {
+                                    eprintln!("  {} added to new part", results.len());
+                                    added_total += results.len() as u32;
+                                    success = true;
+                                    break;
+                                }
+                                Err(e) => {
+                                    eprintln!("  failed: {} (retry in {}s)", e, match attempt { 1 => 1, 2 => 3, _ => 9 });
+                                    tokio::time::sleep(Duration::from_secs(match attempt { 1 => 1, 2 => 3, _ => 9 })).await;
+                                }
+                            }
+                        }
+                        if !success {
+                            eprintln!("  STATUS_FAILED on new playlist too: {}\n  {} songs skipped", last_err, video_ids.len());
+                            failed_total += video_ids.len() as u32;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("  Failed to create next part: {} (skipping batch)", e);
+                        failed_total += video_ids.len() as u32;
+                    }
+                }
+            } else {
+                eprintln!("  STATUS_FAILED after 3 attempts: {}\n  {} songs skipped", last_err, video_ids.len());
+                failed_total += video_ids.len() as u32;
+            }
         }
         // Throttle: ramp delay as more songs are added
         let delay = if added_total > 1000 { 1000 } else if added_total > 500 { 750 } else { 500 };
