@@ -1,6 +1,8 @@
 # terraform-provider-ytmusic
 
-Terraform provider + CLI tools for YouTube Music.
+**Unofficial.** This project uses a reverse-engineered, unauthorized YT Music API.
+Built from scratch — no stolen code, no vendored internals. InnerTube API
+reconstructed from network traffic analysis.
 
 Go provider shells out to Rust sidecar (ytmusic-cli) via JSON stdin/stdout.
 genre-to-playlist populates playlists from genre JSON.
