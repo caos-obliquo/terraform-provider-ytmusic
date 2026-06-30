@@ -12,6 +12,7 @@ use ytmapi_rs::auth::BrowserToken;
 use ytmapi_rs::common::{VideoID, YoutubeID};
 use ytmapi_rs::parse::PlaylistItem;
 use ytmapi_rs::query::playlist::PrivacyStatus;
+use ytmapi_rs::query::playlist::{AddPlaylistItemsQuery, DuplicateHandlingMode};
 use ytmapi_rs::query::CreatePlaylistQuery;
 use ytmapi_rs::query::GetPlaylistTracksQuery;
 use ytmapi_rs::YtMusic;
@@ -454,79 +455,79 @@ async fn main() {
         _ => PrivacyStatus::Private,
     };
 
-    // Add songs in batches with retry + backoff
+    // Add songs in batches with DEDUPE_OPTION_SKIP (skip duplicates silently
+    // instead of failing the entire batch) and longer retry backoff.
+    // Auto-split only on 4900 cap, never on failure — root cause of tiny parts.
+    const MAX_PER_PART: u32 = 4900;
     let batch_size = 50;
     let mut added_total = 0u32;
     let mut failed_total = 0u32;
     let mut part = 1u32;
+    let mut part_added = 0u32;  // tracks songs in current part for split logic
     for chunk in sampled.chunks(batch_size) {
         let video_ids: Vec<VideoID<'_>> = chunk.iter().map(|s| s.video_id.clone()).collect();
+
+        // Auto-split: create new part BEFORE sending batch if current part is nearly full
+        if cli.auto_split && part_added >= MAX_PER_PART && !video_ids.is_empty() {
+            part += 1;
+            let part_name = format!("{} (Pt. {})", base_title, part);
+            let desc = format!("Continuation of {}{}", base_title, GEN_HEADER);
+            eprintln!("  Part {} at {} songs, creating next part: \"{}\"...", part - 1, part_added, part_name);
+            match yt.create_playlist(CreatePlaylistQuery::new(&part_name, Some(&desc), privacy_status.clone())).await {
+                Ok(new_id) => {
+                    eprintln!("  Created: {}", new_id.get_raw());
+                    playlist_id = new_id;
+                    part_added = 0;
+                }
+                Err(e) => {
+                    eprintln!("  Failed to create next part: {} (stopping add)", e);
+                    break;
+                }
+            }
+        }
+
         let mut last_err = String::new();
         let mut success = false;
+        // STATUS_FAILED → 5s/15s/45s backoff (rate limiting)
+        // HTTP errors → instant retry
         for attempt in 1..=3 {
             eprintln!(
                 "Adding batch of {} songs... (attempt {}/3)",
                 video_ids.len(),
                 attempt
             );
-            match yt.add_video_items_to_playlist(playlist_id.clone(), video_ids.clone()).await {
+            let query = AddPlaylistItemsQuery::new_from_videos(
+                playlist_id.clone(),
+                video_ids.clone(),
+                DuplicateHandlingMode::Unhandled,
+            );
+            match yt.query(query).await {
                 Ok(results) => {
-                    eprintln!("  {} added", results.len());
+                    eprintln!("  {} added (duplicates silently skipped)", results.len());
                     added_total += results.len() as u32;
+                    part_added += results.len() as u32;
                     success = true;
                     break;
                 }
                 Err(e) => {
                     last_err = format!("{}", e);
-                    eprintln!("  failed: {} (retry in {}s)", last_err, match attempt { 1 => 1, 2 => 3, _ => 9 });
-                    tokio::time::sleep(Duration::from_secs(match attempt { 1 => 1, 2 => 3, _ => 9 })).await;
+                    let delay = if e.to_string().contains("STATUS_FAILED") {
+                        match attempt { 1 => 5, 2 => 15, _ => 45 }
+                    } else {
+                        match attempt { 1 => 1, 2 => 3, _ => 9 }
+                    };
+                    eprintln!("  failed: {} (retry in {}s)", last_err, delay);
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
                 }
             }
         }
         if !success {
-            if cli.auto_split {
-                // Try creating next part and retry the batch there
-                part += 1;
-                let part_name = format!("{} (Pt. {})", base_title, part);
-                let desc = format!("Continuation of {}{}", base_title, GEN_HEADER);
-                eprintln!("  Creating next part: \"{}\"...", part_name);
-                match yt.create_playlist(CreatePlaylistQuery::new(&part_name, Some(&desc), privacy_status.clone())).await {
-                    Ok(new_id) => {
-                        eprintln!("  Created: {}", new_id.get_raw());
-                        playlist_id = new_id;
-                        // Retry the same batch on new playlist
-                        for attempt in 1..=3 {
-                            eprintln!("  Retrying batch on new playlist (attempt {}/3)", attempt);
-                            match yt.add_video_items_to_playlist(playlist_id.clone(), video_ids.clone()).await {
-                                Ok(results) => {
-                                    eprintln!("  {} added to new part", results.len());
-                                    added_total += results.len() as u32;
-                                    success = true;
-                                    break;
-                                }
-                                Err(e) => {
-                                    eprintln!("  failed: {} (retry in {}s)", e, match attempt { 1 => 1, 2 => 3, _ => 9 });
-                                    tokio::time::sleep(Duration::from_secs(match attempt { 1 => 1, 2 => 3, _ => 9 })).await;
-                                }
-                            }
-                        }
-                        if !success {
-                            eprintln!("  STATUS_FAILED on new playlist too: {}\n  {} songs skipped", last_err, video_ids.len());
-                            failed_total += video_ids.len() as u32;
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("  Failed to create next part: {} (skipping batch)", e);
-                        failed_total += video_ids.len() as u32;
-                    }
-                }
-            } else {
-                eprintln!("  STATUS_FAILED after 3 attempts: {}\n  {} songs skipped", last_err, video_ids.len());
-                failed_total += video_ids.len() as u32;
-            }
+            // Never auto-split on failure. Just log and move on.
+            eprintln!("  Failed after 3 attempts: {}\n  {} songs skipped", last_err, video_ids.len());
+            failed_total += video_ids.len() as u32;
         }
         // Throttle: ramp delay as more songs are added
-        let delay = if added_total > 1000 { 1000 } else if added_total > 500 { 750 } else { 500 };
+        let delay = if added_total > 1000 { 1500 } else if added_total > 500 { 1000 } else { 750 };
         tokio::time::sleep(Duration::from_millis(delay)).await;
     }
     eprintln!("Add phase done: {} added, {} failed", added_total, failed_total);
