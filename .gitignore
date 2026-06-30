@@ -25,6 +25,15 @@ genre-to-playlist/target/
 *.swp
 *.swo
 
+# Song cache files
+*_songs_cache.json
+
+# Raw RYM list files
+*.txt
+
+# Temporary scripts
+parse_rym_list.py
+
 # OS
 .DS_Store
 Thumbs.db

@@ -31,9 +31,24 @@ resource "ytmusic_playlist" "goregrind" {
   }
 }
 
+resource "ytmusic_playlist" "skramz" {
+  title       = "Genre: Skramz"
+  description = "First-wave screamo (2273 entries)"
+  privacy     = "unlisted"
+
+  lifecycle {
+    ignore_changes = all
+  }
+}
+
 # ── Outputs ───────────────────────────────────────────────────────────
 
 output "goregrind_playlist_id" {
   description = "Feed this to genre-to-playlist --playlist-id"
   value = ytmusic_playlist.goregrind.playlist_id
+}
+
+output "skramz_playlist_id" {
+  description = "Feed this to genre-to-playlist --playlist-id"
+  value = ytmusic_playlist.skramz.playlist_id
 }

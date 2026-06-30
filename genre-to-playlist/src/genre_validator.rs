@@ -29,9 +29,16 @@ pub struct GenreClassifier {
 impl GenreClassifier {
     /// Build classifier from target genre name + optional overrides
     pub fn for_genre(target: &str) -> Self {
+        // WARNING: "experimental" is NOT a positive keyword — it's too broad
+        // and lets through non-genre bands. Only add genre-specific terms.
         let mut pos: Vec<String> = vec![
             target.to_lowercase(),
             "screamo".into(),
+            "skramz".into(),
+            "emoviolence".into(),
+            "emotional hardcore".into(),
+            "post-hardcore".into(),
+            "sass".into(),
             "hardcore".into(),
             "powerviolence".into(),
             "grindcore".into(),
@@ -48,7 +55,6 @@ impl GenreClassifier {
             "punk".into(),
             "crust".into(),
             "noise".into(),
-            "experimental".into(),
             "chaotic".into(),
             "metal".into(),
             "heavy".into(),
@@ -102,6 +108,15 @@ impl GenreClassifier {
             "j-pop".into(),
             "classical".into(),
             "ambient".into(),
+            "indie".into(),
+            "folk".into(),
+            "slowcore".into(),
+            "lo-fi".into(),
+            "acoustic".into(),
+            "bedroom".into(),
+            "singer-songwriter".into(),
+            "shoegaze".into(),
+            "post-rock".into(),
         ];
 
         Self { positive: pos, negative: neg }

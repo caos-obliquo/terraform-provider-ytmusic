@@ -7,7 +7,7 @@ use std::fs;
 use clap::Parser;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use ytmapi_rs::auth::BrowserToken;
 use ytmapi_rs::common::{VideoID, YoutubeID};
 use ytmapi_rs::parse::PlaylistItem;
@@ -97,6 +97,10 @@ struct Cli {
     /// Auto-create next part when playlist nears YT Music's 5000 cap
     #[arg(long)]
     auto_split: bool,
+
+    /// Skip search phase, load previously cached sampled songs
+    #[arg(long)]
+    use_cache: bool,
 }
 
 // ─── Genre data ─────────────────────────────────────────────────────────
@@ -122,6 +126,25 @@ struct GenreData {
 }
 
 // ─── Song tracking ──────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize)]
+struct CachedEntry {
+    video_id: String,
+    title: String,
+    artist: String,
+    source: String,
+}
+
+impl From<CachedEntry> for SongEntry {
+    fn from(c: CachedEntry) -> Self {
+        Self {
+            video_id: VideoID::from_raw(c.video_id),
+            title: c.title,
+            artist: c.artist,
+            source: c.source,
+        }
+    }
+}
 
 struct SongEntry {
     video_id: VideoID<'static>,
@@ -251,9 +274,27 @@ async fn main() {
     let mut rejected_count = 0usize;
     let mut uncertain_count = 0usize;
 
-    // Search songs for each item
+    // Search songs for each item (or load from cache)
     let mut all_songs: Vec<SongEntry> = Vec::new();
+    let cache_path = format!("{}_songs_cache.json", genre.genre);
 
+    if cli.use_cache {
+        match fs::read_to_string(&cache_path) {
+            Ok(json) => {
+                let cached: Vec<CachedEntry> = match serde_json::from_str(&json) {
+                    Ok(c) => c,
+                    Err(e) => { eprintln!("Cache parse error: {e}, re-searching"); Vec::new() }
+                };
+                if !cached.is_empty() {
+                    all_songs = cached.into_iter().map(|c| c.into()).collect();
+                    eprintln!("Loaded {} songs from cache ({}), skipping search", all_songs.len(), cache_path);
+                }
+            }
+            Err(_) => eprintln!("No cache file found ({}), searching fresh", cache_path),
+        }
+    }
+
+    if all_songs.is_empty() {
     for (i, item) in items.iter().enumerate() {
         let (display, query, entry_opt) = match item {
             GenreItem::Band(band) => {
@@ -268,18 +309,36 @@ async fn main() {
                 (format!("{} - {}", entry.artist, entry.album), q, Some(entry))
             }
         };
-        eprint!("\rSearching {}/{}: {:<50}", i + 1, total_items, display);
-
-        // Step 1: Search YT Music + apply static filters (strict album match)
-        let matched = match search_item_songs(&yt, &query, &display, entry_opt, per_item, &valid_artists, true).await {
+        // Step 1: Search YT Music (strict album match)
+        let mut matched = match search_item_songs(&yt, &query, &display, entry_opt, per_item, &valid_artists, true).await {
             Ok(songs) => songs,
             Err(e) => {
-                eprintln!("\n  Warning: search failed for {}: {e}", display);
+                eprintln!("[{}/{}] ✗ {} — search error: {e}", i + 1, total_items, display);
                 Vec::new()
             }
         };
 
+        // Step 1b: If album search found nothing, try artist-only search
+        let was_artist_fallback = if matched.is_empty() {
+            if let Some(entry) = entry_opt {
+                let artist_query = entry.artist.clone();
+                match search_item_songs(&yt, &artist_query, &display, Some(entry), per_item, &valid_artists, false).await {
+                    Ok(songs) if !songs.is_empty() => {
+                        eprintln!("[{}/{}] ↵ {} — album not found, trying artist search", i + 1, total_items, display);
+                        matched = songs;
+                        true
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         if matched.is_empty() {
+            eprintln!("[{}/{}] ✗ {} — not found on YT Music", i + 1, total_items, display);
             if i + 1 < total_items {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
@@ -303,37 +362,49 @@ async fn main() {
                 genre_cache.get(&cache_key).unwrap().clone()
             };
 
+            let total_for_entry = matched.len();
             match &verdict {
                 genre_validator::GenreVerdict::Accept => {
                     all_songs.extend(matched);
-                    // Verified genre entry: do a broad artist search to catch more songs
-                    // that album-specific search might have missed.
-                    let broad_query = entry.artist.clone();
-                    // Use higher limit for broad search to get discography coverage
-                    let broad_limit = per_item * 3;
-                    if let Ok(broad_results) = search_item_songs(
-                        &yt, &broad_query, &display, Some(entry), broad_limit,
-                        &valid_artists, true, /* album_match_required = false */
-                    ).await {
-                        all_songs.extend(broad_results);
+                    // If we found via album search (not artist fallback), also do broad search
+                    if !was_artist_fallback {
+                        let broad_query = entry.artist.clone();
+                        let broad_limit = per_item * 3;
+                        let broad_count = if let Ok(broad_results) = search_item_songs(
+                            &yt, &broad_query, &display, Some(entry), broad_limit,
+                            &valid_artists, false,
+                        ).await {
+                            let n = broad_results.len();
+                            all_songs.extend(broad_results);
+                            n
+                        } else { 0 };
+                        accepted_count += 1;
+                        eprintln!("[{}/{}] ✓ {} — {} album + {} broad = {} songs",
+                            i + 1, total_items, display, total_for_entry, broad_count, total_for_entry + broad_count);
+                    } else {
+                        accepted_count += 1;
+                        eprintln!("[{}/{}] ✓ {} — {} songs (from artist fallback)",
+                            i + 1, total_items, display, total_for_entry);
                     }
-                    accepted_count += 1;
                 }
                 genre_validator::GenreVerdict::Reject(reason) => {
-                    eprintln!("\n  ✗ {} rejected: {}", display, reason);
                     rejected_count += 1;
+                    eprintln!("[{}/{}] ✗ {} — {}", i + 1, total_items, display, reason);
                 }
                 genre_validator::GenreVerdict::Uncertain => {
-                    // Fail open: accept but note it
                     all_songs.extend(matched);
                     uncertain_count += 1;
-                    eprintln!("\n  ? {} uncertain genre (added anyway)", display);
+                    let label = if was_artist_fallback { " (artist fallback)" } else { "" };
+                    eprintln!("[{}/{}] ? {} — {} songs (uncertain, added anyway{})",
+                        i + 1, total_items, display, total_for_entry, label);
                 }
             }
         } else {
             // Band mode: no dynamic validation, accept all
+            let n = matched.len();
             all_songs.extend(matched);
             accepted_count += 1;
+            eprintln!("[{}/{}] ✓ {} — {} songs", i + 1, total_items, display, n);
         }
 
         // Rate limit: sleep between searches
@@ -341,12 +412,13 @@ async fn main() {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
+    } // end if all_songs.is_empty()
 
     eprintln!("\nGenre validation: {} accepted, {} rejected, {} uncertain", accepted_count, rejected_count, uncertain_count);
     eprintln!("Found {} songs total from {} items", all_songs.len(), total_items);
 
     // Sample: ensure diversity
-    let sampled = sample_songs(all_songs, cli.max_songs, per_item);
+    let sampled = sample_songs(all_songs, cli.max_songs, per_item, cli.auto_split);
 
     if sampled.is_empty() {
         eprintln!("Error: no songs found for this genre");
@@ -354,6 +426,20 @@ async fn main() {
     }
 
     println!("Sampled {} songs for playlist (max {} per item)", sampled.len(), per_item);
+
+    // Cache sampled songs for reuse (--use-cache on retry)
+    {
+        let cached: Vec<CachedEntry> = sampled.iter().map(|s| CachedEntry {
+            video_id: s.video_id.get_raw().to_string(),
+            title: s.title.clone(),
+            artist: s.artist.clone(),
+            source: s.source.clone(),
+        }).collect();
+        if let Ok(json) = serde_json::to_string_pretty(&cached) {
+            let _ = fs::write(&cache_path, &json);
+            eprintln!("Saved {} songs to cache ({})", cached.len(), cache_path);
+        }
+    }
 
     if cli.dry_run {
         println!("\n── Dry run ──");
@@ -458,7 +544,7 @@ async fn main() {
     // Add songs in batches with DEDUPE_OPTION_SKIP (skip duplicates silently
     // instead of failing the entire batch) and longer retry backoff.
     // Auto-split only on 4900 cap, never on failure — root cause of tiny parts.
-    const MAX_PER_PART: u32 = 4900;
+    const MAX_PER_PART: u32 = 5000;
     let batch_size = 50;
     let mut added_total = 0u32;
     let mut failed_total = 0u32;
@@ -658,7 +744,7 @@ fn playlist_item_video_id(item: &PlaylistItem) -> Option<String> {
 
 // ─── Sampling ───────────────────────────────────────────────────────────
 
-fn sample_songs(all_songs: Vec<SongEntry>, max_songs: usize, per_item: usize) -> Vec<SongEntry> {
+fn sample_songs(all_songs: Vec<SongEntry>, max_songs: usize, per_item: usize, auto_split: bool) -> Vec<SongEntry> {
     // Group songs by source (band or artist name)
     let mut by_source: HashMap<String, Vec<SongEntry>> = HashMap::new();
     for song in all_songs {
@@ -678,8 +764,10 @@ fn sample_songs(all_songs: Vec<SongEntry>, max_songs: usize, per_item: usize) ->
     // Shuffle all selected songs (interleave sources)
     sampled.shuffle(&mut rng);
 
-    // Cap at max_songs
-    sampled.truncate(max_songs);
+    // Cap at max_songs (unless auto-split: let parts handle the limits)
+    if !auto_split {
+        sampled.truncate(max_songs);
+    }
 
     sampled
 }
